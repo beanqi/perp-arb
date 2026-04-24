@@ -2,6 +2,7 @@ use std::{collections::HashMap, sync::RwLock, thread};
 
 use crossbeam_channel::{Receiver, Sender, bounded};
 use serde::Serialize;
+use tracing::warn;
 
 use crate::{
     config::{
@@ -304,7 +305,7 @@ impl ShardRunner {
                     let market = message.market().clone();
                     if let Some(book) = self.books.get_mut(&market) {
                         if book.apply(message) == BookApplyResult::GapDetected {
-                            println!(
+                            warn!(
                                 "{} market {} depth gap detected; waiting for gateway rebuild",
                                 self.shard_id, market
                             );

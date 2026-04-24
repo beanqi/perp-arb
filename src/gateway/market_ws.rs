@@ -3,6 +3,7 @@ mod binance_sync;
 
 use crossbeam_channel::Sender;
 use tokio::task::JoinHandle;
+use tracing::warn;
 
 use crate::{
     config::{
@@ -45,7 +46,7 @@ impl MarketWsHandle {
             match runtime.exchange {
                 Exchange::BinanceUsdM => binance::run(runtime, shard_tx).await,
                 Exchange::BybitLinear => {
-                    println!("market ws {} bybit depth websocket is not implemented yet", runtime.connection_id);
+                    warn!("market ws {} bybit depth websocket is not implemented yet", runtime.connection_id);
                 }
             }
         });

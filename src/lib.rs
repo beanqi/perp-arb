@@ -5,4 +5,5 @@ pub mod config;
 pub mod engine;
 pub mod error;
 pub mod gateway;
+pub mod logging;
 pub mod web_ui;

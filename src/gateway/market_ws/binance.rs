@@ -5,6 +5,7 @@ use futures_util::{SinkExt, StreamExt};
 use reqwest::Client;
 use tokio::time::MissedTickBehavior;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tracing::{info, warn};
 
 use crate::{
     engine::types::ShardEvent,
@@ -19,7 +20,7 @@ pub async fn run(runtime: MarketWsRuntime, shard_tx: Sender<ShardEvent>) {
     let client = Client::new();
     loop {
         if let Err(error) = run_once(&runtime, &shard_tx, &client).await {
-            println!(
+            warn!(
                 "market ws {} exchange={} disconnected: {}",
                 runtime.connection_id, runtime.exchange, error
             );
@@ -34,7 +35,7 @@ async fn run_once(
     client: &Client,
 ) -> Result<(), String> {
     let stream_url = stream_url(&runtime.subscribed_symbols)?;
-    println!(
+    info!(
         "market ws {} -> {} binance connecting symbols=[{}]",
         runtime.connection_id,
         runtime.shard_id,

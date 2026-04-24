@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use crossbeam_channel::Sender;
 use reqwest::Client;
 use serde::Deserialize;
+use tracing::warn;
 
 use crate::{
     config::model::{Exchange, MarketKey},
@@ -56,7 +57,7 @@ impl DepthSynchronizer {
         }
 
         if state.has_sequence_gap() {
-            println!(
+            warn!(
                 "market ws {} binance symbol={} sequence gap detected; rebuilding snapshot",
                 self.runtime.connection_id, symbol
             );

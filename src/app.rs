@@ -5,6 +5,7 @@ use std::{
 };
 
 use tokio::net::TcpListener;
+use tracing::{info, warn};
 
 use crate::{
     admin_api,
@@ -27,6 +28,7 @@ pub struct AppSettings {
     pub bind_addr: SocketAddr,
     pub store_path: PathBuf,
     pub master_key_env: String,
+    pub log_dir: PathBuf,
 }
 
 impl Default for AppSettings {
@@ -35,6 +37,7 @@ impl Default for AppSettings {
             bind_addr: "127.0.0.1:3000".parse().expect("static socket address is valid"),
             store_path: PathBuf::from("data/store.json"),
             master_key_env: "PERP_ARB_MASTER_KEY".to_owned(),
+            log_dir: PathBuf::from("logs"),
         }
     }
 }
@@ -59,11 +62,18 @@ impl AppSettings {
             .map(|value| value.trim().to_owned())
             .filter(|value| !value.is_empty())
             .unwrap_or(defaults.master_key_env);
+        let log_dir = std::env::var("PERP_ARB_LOG_DIR")
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or(defaults.log_dir);
 
         Ok(Self {
             bind_addr,
             store_path,
             master_key_env,
+            log_dir,
         })
     }
 }
@@ -80,7 +90,7 @@ impl AppContext {
         let crypto = CryptoContext::from_env(&settings.master_key_env);
         let store = FileStore::open(settings.store_path.clone(), crypto)?;
         if !store.is_crypto_configured() {
-            println!(
+            warn!(
                 "warning: {} is not set; account writes and runtime loads that require secret decryption will fail",
                 settings.master_key_env
             );
@@ -112,7 +122,7 @@ impl AppContext {
             .map_err(|_| AppError::lock("app update"))?;
         let update = self.store.upsert_strategy(request)?;
         let status = self.runtime.reload(update.runtime_catalog)?;
-        println!("{}", status.rendered_plan);
+        info!("{}", status.rendered_plan);
         Ok(update.entity)
     }
 
@@ -127,7 +137,7 @@ impl AppContext {
             .map_err(|_| AppError::lock("app update"))?;
         let update = self.store.set_strategy_enabled(&strategy_id, request.enabled)?;
         let status = self.runtime.reload(update.runtime_catalog)?;
-        println!("{}", status.rendered_plan);
+        info!("{}", status.rendered_plan);
         Ok(update.entity)
     }
 
@@ -138,7 +148,7 @@ impl AppContext {
             .map_err(|_| AppError::lock("app update"))?;
         let update = self.store.upsert_account(request)?;
         let status = self.runtime.reload(update.runtime_catalog)?;
-        println!("{}", status.rendered_plan);
+        info!("{}", status.rendered_plan);
         Ok(update.entity)
     }
 
@@ -165,12 +175,12 @@ impl AppContext {
 
 pub async fn run(settings: AppSettings) -> AppResult<()> {
     let context = AppContext::bootstrap(&settings)?;
-    println!("{}", context.runtime_status()?.rendered_plan);
+    info!("{}", context.runtime_status()?.rendered_plan);
     let router = admin_api::router(context);
     let listener = TcpListener::bind(settings.bind_addr).await.map_err(|error| {
         AppError::Internal(format!("failed to bind {}: {error}", settings.bind_addr))
     })?;
-    println!("admin api listening on http://{}", settings.bind_addr);
+    info!("admin api listening on http://{}", settings.bind_addr);
 
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
