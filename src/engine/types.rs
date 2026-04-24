@@ -46,6 +46,9 @@ pub enum ShardEvent {
         shard_id: ShardId,
         strategy_ids: Vec<StrategyId>,
     },
+    Shutdown {
+        shard_id: ShardId,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

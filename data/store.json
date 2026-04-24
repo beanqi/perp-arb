@@ -1,0 +1,90 @@
+{
+  "schema_version": 1,
+  "revision": 5,
+  "strategies": [
+    {
+      "id": "btc-binance-bybit",
+      "name": "BTC Binance/Bybit",
+      "enabled": true,
+      "long_leg": {
+        "exchange": "binance_usd_m",
+        "symbol": "BTCUSDT",
+        "account_id": "binance-main"
+      },
+      "short_leg": {
+        "exchange": "bybit_linear",
+        "symbol": "BTCUSDT",
+        "account_id": "bybit-main"
+      },
+      "open_levels": [
+        {
+          "spread_pct": 1.0,
+          "notional_usd": 100.0
+        },
+        {
+          "spread_pct": 2.0,
+          "notional_usd": 100.0
+        }
+      ],
+      "close_levels": [
+        {
+          "spread_pct": 0.5,
+          "notional_usd": 100.0
+        }
+      ],
+      "max_total_notional": 500.0,
+      "max_open_orders": 4,
+      "stale_order_query_ms": 3000,
+      "created_at_ms": 1777017063506,
+      "updated_at_ms": 1777017066363
+    }
+  ],
+  "accounts": [
+    {
+      "id": "binance-main",
+      "name": "Binance Main",
+      "exchange": "binance_usd_m",
+      "enabled": true,
+      "masked_api_key": "dem***ey",
+      "validation_status": "dry_run_ok",
+      "credentials": {
+        "api_key": {
+          "algorithm": "aes-256-gcm-siv",
+          "nonce_b64": "fxlpQ76erXyQ3Zp0",
+          "ciphertext_b64": "L/IuNJ/BVk7MJP042i9Kk/pxK0Vd2dexnpErLQ=="
+        },
+        "api_secret": {
+          "algorithm": "aes-256-gcm-siv",
+          "nonce_b64": "vAunxCsagcSdxsbH",
+          "ciphertext_b64": "wioKQ+PXDwOEySBR5BxjIKU6hrxj2NNDbm1NT2TT4g=="
+        },
+        "passphrase": null
+      },
+      "created_at_ms": 1777017057580,
+      "updated_at_ms": 1777017057580
+    },
+    {
+      "id": "bybit-main",
+      "name": "Bybit Main",
+      "exchange": "bybit_linear",
+      "enabled": true,
+      "masked_api_key": "dem***ey",
+      "validation_status": "dry_run_ok",
+      "credentials": {
+        "api_key": {
+          "algorithm": "aes-256-gcm-siv",
+          "nonce_b64": "i5WdFwwNhHe4GLP0",
+          "ciphertext_b64": "+jH9Oe4k68cOOgCEHNHFQrKIzOaPZfHydkyv7t5OQeIgfA=="
+        },
+        "api_secret": {
+          "algorithm": "aes-256-gcm-siv",
+          "nonce_b64": "KqLsn4nadVTEKRrP",
+          "ciphertext_b64": "FV6Q42zYGpoz93YBYTb2GdeEmJUrc6iJvhgi+nH9lbLc4z5Sqw=="
+        },
+        "passphrase": null
+      },
+      "created_at_ms": 1777017061873,
+      "updated_at_ms": 1777017061873
+    }
+  ]
+}
