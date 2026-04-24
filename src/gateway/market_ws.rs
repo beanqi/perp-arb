@@ -1,9 +1,9 @@
 mod binance;
 mod binance_sync;
+mod bybit;
 
 use crossbeam_channel::Sender;
 use tokio::task::JoinHandle;
-use tracing::warn;
 
 use crate::{
     config::{
@@ -45,9 +45,7 @@ impl MarketWsHandle {
         let task = tokio::spawn(async move {
             match runtime.exchange {
                 Exchange::BinanceUsdM => binance::run(runtime, shard_tx).await,
-                Exchange::BybitLinear => {
-                    warn!("market ws {} bybit depth websocket is not implemented yet", runtime.connection_id);
-                }
+                Exchange::BybitLinear => bybit::run(runtime, shard_tx).await,
             }
         });
         Self { task }
