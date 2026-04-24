@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crossbeam_channel::Sender;
 use reqwest::Client;
 use serde::Deserialize;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::{
     config::model::{Exchange, MarketKey},
@@ -21,6 +21,7 @@ pub(super) struct DepthSynchronizer {
     runtime: MarketWsRuntime,
     client: Client,
     states: HashMap<String, SymbolSyncState>,
+    seen_first_payload: bool,
 }
 
 impl DepthSynchronizer {
@@ -34,6 +35,7 @@ impl DepthSynchronizer {
             runtime: runtime.clone(),
             client,
             states,
+            seen_first_payload: false,
         }
     }
 
@@ -45,6 +47,13 @@ impl DepthSynchronizer {
         let Some(message) = decode_raw_depth(self.runtime.exchange, payload) else {
             return Ok(());
         };
+        if !self.seen_first_payload {
+            info!(
+                "market ws {} binance first depth payload received",
+                self.runtime.connection_id
+            );
+            self.seen_first_payload = true;
+        }
         let symbol = message.market().symbol.clone();
         let Some(state) = self.states.get_mut(&symbol) else {
             return Ok(());
@@ -52,7 +61,7 @@ impl DepthSynchronizer {
         state.buffer(message);
 
         if !state.ready {
-            self.rebuild_symbol(&symbol, shard_tx).await?;
+            self.initialize_symbol(&symbol, shard_tx).await?;
             return Ok(());
         }
 
@@ -61,8 +70,8 @@ impl DepthSynchronizer {
                 "market ws {} binance symbol={} sequence gap detected; rebuilding snapshot",
                 self.runtime.connection_id, symbol
             );
-            state.ready = false;
-            self.rebuild_symbol(&symbol, shard_tx).await?;
+            self.reset_symbol(&symbol);
+            self.initialize_symbol(&symbol, shard_tx).await?;
             return Ok(());
         }
 
@@ -72,22 +81,60 @@ impl DepthSynchronizer {
         Ok(())
     }
 
-    async fn rebuild_symbol(
+    async fn initialize_symbol(
         &mut self,
         symbol: &str,
         shard_tx: &Sender<ShardEvent>,
     ) -> Result<(), String> {
-        let snapshot = fetch_snapshot(&self.client, symbol).await?;
-        let last_update_id = snapshot.last_update_id;
+        if self
+            .states
+            .get(symbol)
+            .ok_or_else(|| format!("missing sync state for {symbol}"))?
+            .snapshot
+            .is_none()
+        {
+            let snapshot = fetch_snapshot(&self.client, symbol).await?;
+            info!(
+                "market ws {} binance symbol={} snapshot fetched last_update_id={} bids={} asks={}",
+                self.runtime.connection_id,
+                symbol,
+                snapshot.last_update_id,
+                snapshot.bids.len(),
+                snapshot.asks.len()
+            );
+            let state = self
+                .states
+                .get_mut(symbol)
+                .ok_or_else(|| format!("missing sync state for {symbol}"))?;
+            state.snapshot = Some(snapshot);
+        }
+
         let state = self
             .states
             .get_mut(symbol)
             .ok_or_else(|| format!("missing sync state for {symbol}"))?;
+        let last_update_id = state
+            .snapshot
+            .as_ref()
+            .map(|snapshot| snapshot.last_update_id)
+            .ok_or_else(|| format!("missing snapshot for {symbol}"))?;
         state.discard_stale(last_update_id);
 
         let Some(first_delta_index) = state.find_snapshot_bridge(last_update_id) else {
+            warn!(
+                "market ws {} binance symbol={} waiting snapshot bridge last_update_id={} pending_deltas={}",
+                self.runtime.connection_id,
+                symbol,
+                last_update_id,
+                state.pending.len()
+            );
             return Ok(());
         };
+
+        let snapshot = state
+            .snapshot
+            .take()
+            .ok_or_else(|| format!("missing snapshot for {symbol}"))?;
 
         send_depth_message(
             &self.runtime,
@@ -103,13 +150,26 @@ impl DepthSynchronizer {
         for delta in state.mark_ready_and_drain_from(first_delta_index) {
             send_depth_message(&self.runtime, shard_tx, delta)?;
         }
+        info!(
+            "market ws {} binance symbol={} depth synchronized last_update_id={}",
+            self.runtime.connection_id,
+            symbol,
+            last_update_id
+        );
         Ok(())
+    }
+
+    fn reset_symbol(&mut self, symbol: &str) {
+        if let Some(state) = self.states.get_mut(symbol) {
+            state.reset();
+        }
     }
 }
 
 struct SymbolSyncState {
     ready: bool,
     last_sequence: Option<u64>,
+    snapshot: Option<BinanceSnapshot>,
     pending: Vec<RawDepthMessage>,
 }
 
@@ -118,6 +178,7 @@ impl SymbolSyncState {
         Self {
             ready: false,
             last_sequence: None,
+            snapshot: None,
             pending: Vec::new(),
         }
     }
@@ -194,6 +255,13 @@ impl SymbolSyncState {
                 self.last_sequence = sequence.or(self.last_sequence);
             }
         }
+    }
+
+    fn reset(&mut self) {
+        self.ready = false;
+        self.last_sequence = None;
+        self.snapshot = None;
+        self.pending.clear();
     }
 }
 

@@ -304,7 +304,8 @@ impl ShardRunner {
                 if let Some(message) = decode_raw_depth(exchange, &payload) {
                     let market = message.market().clone();
                     if let Some(book) = self.books.get_mut(&market) {
-                        if book.apply(message) == BookApplyResult::GapDetected {
+                        let result = book.apply(message);
+                        if result == BookApplyResult::GapDetected {
                             warn!(
                                 "{} market {} depth gap detected; waiting for gateway rebuild",
                                 self.shard_id, market

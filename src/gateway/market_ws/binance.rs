@@ -45,6 +45,12 @@ async fn run_once(
     let (ws_stream, _) = connect_async(&stream_url)
         .await
         .map_err(|error| format!("connect failed: {error}"))?;
+    info!(
+        "market ws {} -> {} binance connected symbols=[{}]",
+        runtime.connection_id,
+        runtime.shard_id,
+        runtime.subscribed_symbols.join(", ")
+    );
     let (mut write, mut read) = ws_stream.split();
     let mut keepalive = tokio::time::interval(KEEPALIVE_INTERVAL);
     keepalive.set_missed_tick_behavior(MissedTickBehavior::Delay);
