@@ -179,8 +179,9 @@ pub async fn run(settings: AppSettings) -> AppResult<()> {
 }
 
 pub fn print_plan(settings: AppSettings) -> AppResult<()> {
-    let context = AppContext::bootstrap(&settings)?;
-    println!("{}", context.runtime_status()?.rendered_plan);
+    let crypto = CryptoContext::from_env(&settings.master_key_env);
+    let store = FileStore::open(settings.store_path, crypto)?;
+    println!("{}", store.runtime_plan_without_credentials()?.render_text());
     Ok(())
 }
 

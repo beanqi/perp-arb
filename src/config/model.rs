@@ -35,7 +35,7 @@ impl Exchange {
 impl Display for Exchange {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         let value = match self {
-            Self::BinanceUsdM => "binance_usdm",
+            Self::BinanceUsdM => "binance_usd_m",
             Self::BybitLinear => "bybit_linear",
         };
         f.write_str(value)

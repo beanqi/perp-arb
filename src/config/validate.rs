@@ -31,15 +31,6 @@ pub fn validate_strategy_request(
         ));
     }
 
-    let same_leg = long_leg.exchange == short_leg.exchange
-        && long_leg.symbol == short_leg.symbol
-        && long_leg.account_id == short_leg.account_id;
-    if same_leg {
-        return Err(AppError::Validation(
-            "long_leg 与 short_leg 不能完全相同".to_owned(),
-        ));
-    }
-
     if request.enabled {
         ensure_account_enabled(&long_leg.account_id, &accounts_by_id, &id)?;
         ensure_account_enabled(&short_leg.account_id, &accounts_by_id, &id)?;

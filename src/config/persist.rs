@@ -13,6 +13,7 @@ use crate::{
             AccountCredentials, AccountRecord, AccountUpsertRequest, AccountView, EncryptedAccountSecrets,
             PersistedStore, RuntimeAccount, RuntimeCatalog, StrategyRecord, StrategyUpsertRequest, now_ms,
         },
+        planner::{RuntimePlan, build_runtime_plan},
         validate::{validate_account_request, validate_existing_strategies, validate_strategy_request},
     },
     error::{AppError, AppResult},
@@ -186,6 +187,17 @@ impl FileStore {
     pub fn runtime_catalog(&self) -> AppResult<RuntimeCatalog> {
         let store = self.lock_store()?;
         self.runtime_catalog_from_store(&store)
+    }
+
+    pub fn runtime_plan_without_credentials(&self) -> AppResult<RuntimePlan> {
+        let store = self.lock_store()?;
+        let enabled_strategies = store
+            .strategies
+            .iter()
+            .filter(|strategy| strategy.enabled)
+            .cloned()
+            .collect::<Vec<_>>();
+        Ok(build_runtime_plan(&enabled_strategies))
     }
 
     fn runtime_catalog_from_store(&self, store: &PersistedStore) -> AppResult<RuntimeCatalog> {
