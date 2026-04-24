@@ -21,6 +21,10 @@ use crate::{
     },
     engine::shard::{RuntimeManager, RuntimeStatusView},
     error::{AppError, AppResult},
+    market_rules::{
+        DEFAULT_MARKET_RULE_REFRESH_INTERVAL, MarketRuleRefreshHandle, MarketRuleStore,
+        refresh_market_rules,
+    },
 };
 
 #[derive(Clone, Debug)]
@@ -82,6 +86,8 @@ impl AppSettings {
 pub struct AppContext {
     store: FileStore,
     runtime: RuntimeManager,
+    market_rules: Arc<MarketRuleStore>,
+    _market_rule_refresh: Option<MarketRuleRefreshHandle>,
     update_lock: Mutex<()>,
 }
 
@@ -96,14 +102,27 @@ impl AppContext {
             );
         }
 
+        let market_rules = Arc::new(MarketRuleStore::new());
+        let market_rule_refresh = tokio::runtime::Handle::try_current()
+            .ok()
+            .map(|_| {
+                MarketRuleRefreshHandle::spawn(
+                    market_rules.clone(),
+                    DEFAULT_MARKET_RULE_REFRESH_INTERVAL,
+                )
+            });
+
         let context = Arc::new(Self {
             store,
-            runtime: RuntimeManager::new(),
+            runtime: RuntimeManager::new(market_rules.clone()),
+            market_rules,
+            _market_rule_refresh: market_rule_refresh,
             update_lock: Mutex::new(()),
         });
 
         let runtime_catalog = context.store.runtime_catalog()?;
-        context.runtime.reload(runtime_catalog)?;
+        let status = context.runtime.reload(runtime_catalog)?;
+        context.update_market_rule_watch(&status);
         Ok(context)
     }
 
@@ -122,6 +141,7 @@ impl AppContext {
             .map_err(|_| AppError::lock("app update"))?;
         let update = self.store.upsert_strategy(request)?;
         let status = self.runtime.reload(update.runtime_catalog)?;
+        self.update_market_rule_watch(&status);
         info!("{}", status.rendered_plan);
         Ok(update.entity)
     }
@@ -137,6 +157,7 @@ impl AppContext {
             .map_err(|_| AppError::lock("app update"))?;
         let update = self.store.set_strategy_enabled(&strategy_id, request.enabled)?;
         let status = self.runtime.reload(update.runtime_catalog)?;
+        self.update_market_rule_watch(&status);
         info!("{}", status.rendered_plan);
         Ok(update.entity)
     }
@@ -148,6 +169,7 @@ impl AppContext {
             .map_err(|_| AppError::lock("app update"))?;
         let update = self.store.upsert_account(request)?;
         let status = self.runtime.reload(update.runtime_catalog)?;
+        self.update_market_rule_watch(&status);
         info!("{}", status.rendered_plan);
         Ok(update.entity)
     }
@@ -170,6 +192,27 @@ impl AppContext {
 
     pub fn active_orders(&self) -> AppResult<Vec<ActiveOrderView>> {
         self.runtime.active_orders()
+    }
+
+    fn update_market_rule_watch(&self, status: &RuntimeStatusView) {
+        self.market_rules.watch_markets(
+            status
+                .plan
+                .shards
+                .iter()
+                .flat_map(|shard| shard.subscribed_markets.iter().cloned()),
+        );
+        self.refresh_market_rules_once();
+    }
+
+    fn refresh_market_rules_once(&self) {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            let market_rules = self.market_rules.clone();
+            tokio::spawn(async move {
+                let client = reqwest::Client::new();
+                refresh_market_rules(&market_rules, &client).await;
+            });
+        }
     }
 }
 

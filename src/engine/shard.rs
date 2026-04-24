@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::RwLock, thread};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock},
+    thread,
+};
 
 use crossbeam_channel::{Receiver, Sender, bounded};
 use serde::Serialize;
@@ -12,6 +16,7 @@ use crate::{
     },
     error::{AppError, AppResult},
     gateway::market_ws::{MarketWsHandle, MarketWsRuntime},
+    market_rules::MarketRuleStore,
 };
 
 use super::{
@@ -93,10 +98,11 @@ struct RuntimeRegistry {
 #[derive(Debug)]
 pub struct RuntimeManager {
     inner: RwLock<RuntimeRegistry>,
+    market_rules: Arc<MarketRuleStore>,
 }
 
 impl RuntimeManager {
-    pub fn new() -> Self {
+    pub fn new(market_rules: Arc<MarketRuleStore>) -> Self {
         Self {
             inner: RwLock::new(RuntimeRegistry {
                 status: RuntimeStatusView::empty(),
@@ -104,6 +110,7 @@ impl RuntimeManager {
                 market_ws_handles: Vec::new(),
                 route_by_connection: HashMap::new(),
             }),
+            market_rules,
         }
     }
 
@@ -113,7 +120,14 @@ impl RuntimeManager {
         let shard_mailboxes = plan
             .shards
             .iter()
-            .map(|shard| Self::bootstrap_mailbox(shard, &plan, &mut route_by_connection))
+            .map(|shard| {
+                Self::bootstrap_mailbox(
+                    shard,
+                    &plan,
+                    &mut route_by_connection,
+                    self.market_rules.clone(),
+                )
+            })
             .collect::<Vec<_>>();
         let market_ws_handles = if tokio::runtime::Handle::try_current().is_ok() {
             plan.connections
@@ -214,6 +228,7 @@ impl RuntimeManager {
         shard: &ShardPlan,
         plan: &RuntimePlan,
         route_by_connection: &mut HashMap<ConnectionId, Sender<ShardEvent>>,
+        market_rules: Arc<MarketRuleStore>,
     ) -> ShardMailbox {
         let (event_tx, event_rx) = bounded(EVENT_QUEUE_BOUND);
         let (command_tx, command_rx) = bounded(COMMAND_QUEUE_BOUND);
@@ -221,7 +236,13 @@ impl RuntimeManager {
             route_by_connection.insert(connection_id.clone(), event_tx.clone());
         }
 
-        let runner = ShardRunner::from_plan(shard, plan, event_rx, command_rx);
+        let runner = ShardRunner::from_plan(
+            shard,
+            plan,
+            event_rx,
+            command_rx,
+            market_rules,
+        );
         let worker = thread::Builder::new()
             .name(shard.shard_id.to_string())
             .spawn(move || runner.run())
@@ -240,6 +261,7 @@ struct ShardRunner {
     event_rx: Receiver<ShardEvent>,
     command_rx: Receiver<TradeCommand>,
     books: HashMap<MarketKey, LocalBookState>,
+    market_rules: Arc<MarketRuleStore>,
 }
 
 impl ShardRunner {
@@ -248,6 +270,7 @@ impl ShardRunner {
         plan: &RuntimePlan,
         event_rx: Receiver<ShardEvent>,
         command_rx: Receiver<TradeCommand>,
+        market_rules: Arc<MarketRuleStore>,
     ) -> Self {
         let mut depth_mode_by_market = HashMap::new();
         for connection in &plan.connections {
@@ -278,6 +301,7 @@ impl ShardRunner {
             event_rx,
             command_rx,
             books,
+            market_rules,
         }
     }
 
@@ -305,17 +329,17 @@ impl ShardRunner {
                     let market = message.market().clone();
                     if let Some(book) = self.books.get_mut(&market) {
                         let result = book.apply(message);
-                        let (bid_depth, ask_depth) = book.level_counts();
-                        info!(
-                            "{} market {} depth applied result={:?} best_bid={:?} best_ask={:?} bid_depth={} ask_depth={}",
-                            self.shard_id,
-                            market,
-                            result,
-                            book.best_bid(),
-                            book.best_ask(),
-                            bid_depth,
-                            ask_depth
-                        );
+                        // let (bid_depth, ask_depth) = book.level_counts();
+                        // info!(
+                        //     "{} market {} depth applied result={:?} best_bid={:?} best_ask={:?} bid_depth={} ask_depth={}",
+                        //     self.shard_id,
+                        //     market,
+                        //     result,
+                        //     book.best_bid(),
+                        //     book.best_ask(),
+                        //     bid_depth,
+                        //     ask_depth
+                        // );
                         if result == BookApplyResult::GapDetected {
                             warn!(
                                 "{} market {} depth gap detected; waiting for gateway rebuild",
@@ -334,7 +358,34 @@ impl ShardRunner {
         }
     }
 
-    fn handle_command(&mut self, _: TradeCommand) {
-        let _ = &self.shard_id;
+    fn handle_command(&mut self, command: TradeCommand) {
+        if let TradeCommand::PlaceOrder {
+            exchange,
+            symbol,
+            qty,
+            limit_price,
+            ..
+        } = &command
+        {
+            let market = MarketKey::new(*exchange, symbol.clone());
+            match self.market_rules.get(&market) {
+                Some(rule) => info!(
+                    "{} order market={} qty={} limit_price={:?} rule price_tick={:?} qty_step={:?} min_qty={:?} min_notional={:?} contract_multiplier={:?}",
+                    self.shard_id,
+                    market,
+                    qty,
+                    limit_price,
+                    rule.price_tick,
+                    rule.qty_step,
+                    rule.min_qty,
+                    rule.min_notional,
+                    rule.contract_multiplier
+                ),
+                None => warn!(
+                    "{} order market={} has no cached market rule yet",
+                    self.shard_id, market
+                ),
+            }
+        }
     }
 }

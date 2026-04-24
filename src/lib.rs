@@ -6,4 +6,5 @@ pub mod engine;
 pub mod error;
 pub mod gateway;
 pub mod logging;
+pub mod market_rules;
 pub mod web_ui;
