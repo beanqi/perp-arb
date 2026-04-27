@@ -281,57 +281,14 @@ fn send_depth_message(
     message: RawDepthMessage,
     received_at: Instant,
 ) -> Result<(), String> {
-    let payload = encode_depth_message(message)?;
-    let serialized_at = Instant::now();
     shard_tx
         .try_send(ShardEvent::MarketWsRaw {
             connection_id: runtime.connection_id.clone(),
             exchange: runtime.exchange,
             received_at,
-            serialized_at,
-            payload,
+            message,
         })
         .map_err(|error| format!("shard queue send failed: {error}"))
-}
-
-fn encode_depth_message(message: RawDepthMessage) -> Result<Vec<u8>, String> {
-    let value = match message {
-        RawDepthMessage::Snapshot {
-            market,
-            sequence,
-            bids,
-            asks,
-        } => serde_json::json!({
-            "s": market.symbol,
-            "lastUpdateId": sequence,
-            "bids": serialize_levels(bids),
-            "asks": serialize_levels(asks),
-        }),
-        RawDepthMessage::Delta {
-            market,
-            first_sequence,
-            previous_sequence,
-            sequence,
-            bids,
-            asks,
-        } => serde_json::json!({
-            "e": "depthUpdate",
-            "s": market.symbol,
-            "U": first_sequence,
-            "u": sequence,
-            "pu": previous_sequence,
-            "b": serialize_levels(bids),
-            "a": serialize_levels(asks),
-        }),
-    };
-    serde_json::to_vec(&value).map_err(|error| format!("depth encode failed: {error}"))
-}
-
-fn serialize_levels(levels: Vec<PriceLevel>) -> Vec<[String; 2]> {
-    levels
-        .into_iter()
-        .map(|level| [level.price.to_string(), level.qty.to_string()])
-        .collect()
 }
 
 async fn fetch_snapshot(client: &Client, symbol: &str) -> Result<BinanceSnapshot, String> {

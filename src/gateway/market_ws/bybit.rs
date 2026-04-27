@@ -147,15 +147,12 @@ impl BybitDepthSynchronizer {
             return Ok(());
         }
 
-        let payload = payload.to_vec();
-        let serialized_at = Instant::now();
         shard_tx
             .try_send(ShardEvent::MarketWsRaw {
                 connection_id: self.runtime.connection_id.clone(),
                 exchange: self.runtime.exchange,
                 received_at,
-                serialized_at,
-                payload,
+                message,
             })
             .map_err(|error| format!("shard queue send failed: {error}"))
     }

@@ -2,9 +2,10 @@ use std::{
     collections::HashMap,
     sync::{Arc, RwLock},
     thread,
+    time::{Duration, Instant},
 };
 
-use crossbeam_channel::{Receiver, Sender, bounded};
+use crossbeam_channel::{Receiver, Sender, bounded, tick};
 use serde::Serialize;
 use tracing::{info, warn};
 
@@ -23,17 +24,18 @@ use crate::{
 };
 
 use super::{
-    book::{BookApplyResult, LocalBookState, decode_raw_depth},
+    book::{BookApplyResult, LocalBookState},
     strategy::{StrategyAction, StrategyOrderPlan, StrategyRuntimeState, strategy_markets},
     telemetry::{
         StrategyMatchEvent, StrategyMatchEventKind, StrategyRuntimeDescriptor, StrategyRuntimeSnapshot,
-        StrategyTelemetryEvent, StrategyTelemetryHub,
+        StrategyRuntimeMetrics, StrategyTelemetryEvent, StrategyTelemetryHub,
     },
     types::{ShardEvent, TradeCommand},
 };
 
 const EVENT_QUEUE_BOUND: usize = 4096;
 const COMMAND_QUEUE_BOUND: usize = 1024;
+const METRICS_FLUSH_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug)]
 struct ShardMailbox {
@@ -294,13 +296,23 @@ struct ShardRunner {
     event_rx: Receiver<ShardEvent>,
     command_tx: Sender<TradeCommand>,
     command_rx: Receiver<TradeCommand>,
-    books: HashMap<MarketKey, LocalBookState>,
-    strategies: HashMap<StrategyId, StrategyRecord>,
-    strategies_by_market: HashMap<MarketKey, Vec<StrategyId>>,
-    strategy_states: HashMap<StrategyId, StrategyRuntimeState>,
+    books: Vec<LocalBookState>,
+    book_by_market: HashMap<MarketKey, usize>,
+    strategies: Vec<RuntimeStrategy>,
+    strategies_by_book: Vec<Vec<usize>>,
+    strategy_states: Vec<StrategyRuntimeState>,
+    pending_metrics: Vec<Option<StrategyRuntimeMetrics>>,
     telemetry_generation: u64,
     telemetry_tx: Sender<StrategyTelemetryEvent>,
     market_rules: Arc<MarketRuleStore>,
+}
+
+struct RuntimeStrategy {
+    strategy: StrategyRecord,
+    long_market: MarketKey,
+    short_market: MarketKey,
+    long_book_index: usize,
+    short_book_index: usize,
 }
 
 impl ShardRunner {
@@ -327,46 +339,56 @@ impl ShardRunner {
                 );
             }
         }
-        let books = shard
-            .subscribed_markets
-            .iter()
-            .map(|market| {
-                let mode = depth_mode_by_market
-                    .get(market)
-                    .copied()
-                    .unwrap_or_else(|| market.exchange.capabilities().depth_mode);
-                (market.clone(), LocalBookState::new(market.clone(), mode))
-            })
-            .collect();
+        let mut books = Vec::with_capacity(shard.subscribed_markets.len());
+        let mut book_by_market = HashMap::with_capacity(shard.subscribed_markets.len());
+        for market in &shard.subscribed_markets {
+            let mode = depth_mode_by_market
+                .get(market)
+                .copied()
+                .unwrap_or_else(|| market.exchange.capabilities().depth_mode);
+            let book_index = books.len();
+            book_by_market.insert(market.clone(), book_index);
+            books.push(LocalBookState::new(market.clone(), mode));
+        }
         let shard_strategy_ids = shard
             .strategy_ids
             .iter()
             .cloned()
             .collect::<std::collections::HashSet<_>>();
-        let strategies = enabled_strategies
+        let mut strategies = Vec::new();
+        let mut strategy_states = Vec::new();
+        for strategy in enabled_strategies
             .iter()
             .filter(|strategy| shard_strategy_ids.contains(&strategy.id))
-            .map(|strategy| (strategy.id.clone(), strategy.clone()))
-            .collect::<HashMap<_, _>>();
-        let strategy_states = strategies
-            .keys()
-            .cloned()
-            .map(|strategy_id| {
-                (
-                    strategy_id.clone(),
-                    StrategyRuntimeState::new(strategy_id),
-                )
-            })
-            .collect::<HashMap<_, _>>();
-        let mut strategies_by_market = HashMap::<MarketKey, Vec<StrategyId>>::new();
-        for strategy in strategies.values() {
-            for market in strategy_markets(strategy) {
-                strategies_by_market
-                    .entry(market)
-                    .or_default()
-                    .push(strategy.id.clone());
+        {
+            let [long_market, short_market] = strategy_markets(strategy);
+            let (Some(&long_book_index), Some(&short_book_index)) = (
+                book_by_market.get(&long_market),
+                book_by_market.get(&short_market),
+            ) else {
+                warn!(
+                    "{} strategy {} skipped: missing runtime book for {} or {}",
+                    shard.shard_id, strategy.id, long_market, short_market
+                );
+                continue;
+            };
+            strategy_states.push(StrategyRuntimeState::new(strategy.id.clone()));
+            strategies.push(RuntimeStrategy {
+                strategy: strategy.clone(),
+                long_market,
+                short_market,
+                long_book_index,
+                short_book_index,
+            });
+        }
+        let mut strategies_by_book = vec![Vec::<usize>::new(); books.len()];
+        for (strategy_index, runtime) in strategies.iter().enumerate() {
+            strategies_by_book[runtime.long_book_index].push(strategy_index);
+            if runtime.short_book_index != runtime.long_book_index {
+                strategies_by_book[runtime.short_book_index].push(strategy_index);
             }
         }
+        let pending_metrics = vec![None; strategies.len()];
 
         Self {
             shard_id: shard.shard_id.clone(),
@@ -374,9 +396,11 @@ impl ShardRunner {
             command_tx,
             command_rx,
             books,
+            book_by_market,
             strategies,
-            strategies_by_market,
+            strategies_by_book,
             strategy_states,
+            pending_metrics,
             telemetry_generation,
             telemetry_tx,
             market_rules,
@@ -384,16 +408,24 @@ impl ShardRunner {
     }
 
     fn run(mut self) {
+        let telemetry_tick = tick(METRICS_FLUSH_INTERVAL);
         loop {
             crossbeam_channel::select! {
                 recv(self.event_rx) -> event => match event {
-                    Ok(ShardEvent::Shutdown { .. }) | Err(_) => break,
+                    Ok(ShardEvent::Shutdown { .. }) | Err(_) => {
+                        self.flush_metrics();
+                        break;
+                    }
                     Ok(event) => self.handle_event(event),
                 },
                 recv(self.command_rx) -> command => match command {
                     Ok(command) => self.handle_command(command),
-                    Err(_) => break,
+                    Err(_) => {
+                        self.flush_metrics();
+                        break;
+                    }
                 },
+                recv(telemetry_tick) -> _ => self.flush_metrics(),
             }
         }
     }
@@ -401,45 +433,42 @@ impl ShardRunner {
     fn handle_event(&mut self, event: ShardEvent) {
         match event {
             ShardEvent::MarketWsRaw {
-                exchange,
                 received_at,
-                serialized_at,
-                payload,
+                message,
                 ..
             } => {
-                if let Some(message) = decode_raw_depth(exchange, &payload) {
-                    let market = message.market().clone();
-                    if let Some(book) = self.books.get_mut(&market) {
-                        let result = book.apply(message);
-                        // let (bid_depth, ask_depth) = book.level_counts();
-                        // info!(
-                        //     "{} market {} depth applied result={:?} best_bid={:?} best_ask={:?} bid_depth={} ask_depth={}",
-                        //     self.shard_id,
-                        //     market,
-                        //     result,
-                        //     book.best_bid(),
-                        //     book.best_ask(),
-                        //     bid_depth,
-                        //     ask_depth
-                        // );
-                        if result == BookApplyResult::GapDetected {
-                            warn!(
-                                "{} market {} depth gap detected; waiting for gateway rebuild",
-                                self.shard_id, market
-                            );
-                        } else if result == BookApplyResult::Applied {
-                            self.evaluate_market(&market);
-                            let serialize_elapsed = serialized_at.saturating_duration_since(received_at);
-                            let match_elapsed = received_at.elapsed();
-                            info!(
-                                "{} market {} depth latency serialize_us={} match_us={}",
-                                self.shard_id,
-                                market,
-                                serialize_elapsed.as_micros(),
-                                match_elapsed.as_micros()
-                            );
-                        }
-                    }
+                let Some(&book_index) = self.book_by_market.get(message.market()) else {
+                    return;
+                };
+                let result = self.books[book_index].apply(message);
+                let serialized_at = Instant::now();
+                // let (bid_depth, ask_depth) = self.books[book_index].level_counts();
+                // info!(
+                //     "{} market {} depth applied result={:?} best_bid={:?} best_ask={:?} bid_depth={} ask_depth={}",
+                //     self.shard_id,
+                //     self.books[book_index].market,
+                //     result,
+                //     self.books[book_index].best_bid(),
+                //     self.books[book_index].best_ask(),
+                //     bid_depth,
+                //     ask_depth
+                // );
+                if result == BookApplyResult::GapDetected {
+                    warn!(
+                        "{} market {} depth gap detected; waiting for gateway rebuild",
+                        self.shard_id, self.books[book_index].market
+                    );
+                } else if result == BookApplyResult::Applied {
+                    self.evaluate_book(book_index);
+                    let serialize_elapsed = serialized_at.saturating_duration_since(received_at);
+                    let match_elapsed = received_at.elapsed();
+                    info!(
+                        "{} market {} depth latency serialize_us={} match_us={}",
+                        self.shard_id,
+                        self.books[book_index].market,
+                        serialize_elapsed.as_micros(),
+                        match_elapsed.as_micros()
+                    );
                 }
             }
             ShardEvent::TimerTick { .. }
@@ -482,64 +511,46 @@ impl ShardRunner {
         }
     }
 
-    fn evaluate_market(&mut self, market: &MarketKey) {
-        let Some(strategy_ids) = self.strategies_by_market.get(market).cloned() else {
+    fn evaluate_book(&mut self, book_index: usize) {
+        let Some(strategy_indices) = self.strategies_by_book.get(book_index) else {
             return;
         };
+        let strategy_count = strategy_indices.len();
 
-        for strategy_id in strategy_ids {
-            let Some(strategy) = self.strategies.get(&strategy_id) else {
-                continue;
-            };
-            let [long_market, short_market] = strategy_markets(strategy);
-            let (Some(long_book), Some(short_book)) =
-                (self.books.get(&long_market), self.books.get(&short_market))
-            else {
-                continue;
-            };
+        for offset in 0..strategy_count {
+            let strategy_index = self.strategies_by_book[book_index][offset];
+            let runtime = &self.strategies[strategy_index];
+            let long_book = &self.books[runtime.long_book_index];
+            let short_book = &self.books[runtime.short_book_index];
             if !long_book.has_snapshot || !short_book.has_snapshot {
                 continue;
             }
-            let Some((evaluation, open_spread_pct, close_spread_pct)) =
-                self.strategy_states.get_mut(&strategy_id).map(|state| {
-                    let evaluation = state.evaluate(strategy, long_book, short_book);
-                    (
-                        evaluation,
-                        state.last_open_spread_pct,
-                        state.last_close_spread_pct,
-                    )
-                })
-            else {
-                continue;
+            let (evaluation, open_spread_pct, close_spread_pct) = {
+                let state = &mut self.strategy_states[strategy_index];
+                let evaluation = state.evaluate(&runtime.strategy, long_book, short_book);
+                (
+                    evaluation,
+                    state.last_open_spread_pct,
+                    state.last_close_spread_pct,
+                )
             };
             let mut metrics = evaluation.metrics;
             let mut planned_order = None;
             let mut commands = Vec::new();
 
             if let Some(plan) = evaluation.planned_order
-                && let Some(prepared_plan) = self.prepare_plan_for_order(strategy, &plan)
+                && let Some(prepared_plan) = self.prepare_plan_for_order(runtime, &plan)
             {
-                commands = self
-                    .strategy_states
-                    .get_mut(&strategy_id)
-                    .map(|state| state.commit_plan(&self.shard_id, strategy, &prepared_plan))
-                    .unwrap_or_default();
-                if let Some(state) = self.strategy_states.get(&strategy_id) {
-                    metrics = state.metrics();
-                }
+                let state = &mut self.strategy_states[strategy_index];
+                commands = state.commit_plan(&self.shard_id, &runtime.strategy, &prepared_plan);
+                metrics = state.metrics();
                 planned_order = Some(prepared_plan);
             }
 
-            let ts_ms = now_ms();
-            self.send_telemetry(StrategyTelemetryEvent::MetricsUpdated {
-                generation: self.telemetry_generation,
-                shard_id: self.shard_id.clone(),
-                strategy_id: strategy_id.clone(),
-                metrics,
-                ts_ms,
-            });
+            self.pending_metrics[strategy_index] = Some(metrics);
 
             if let Some(plan) = planned_order {
+                let ts_ms = now_ms();
                 let kind = match plan.action {
                     StrategyAction::Open => StrategyMatchEventKind::OpenPlanned,
                     StrategyAction::Close => StrategyMatchEventKind::ClosePlanned,
@@ -549,7 +560,7 @@ impl ShardRunner {
                     event: StrategyMatchEvent {
                         ts_ms,
                         shard_id: self.shard_id.clone(),
-                        strategy_id: strategy_id.clone(),
+                        strategy_id: runtime.strategy.id.clone(),
                         kind,
                         open_spread_pct,
                         close_spread_pct,
@@ -566,32 +577,47 @@ impl ShardRunner {
                 if let Err(error) = self.command_tx.try_send(command) {
                     warn!(
                         "{} strategy {} failed to enqueue trade command: {}",
-                        self.shard_id, strategy_id, error
+                        self.shard_id, runtime.strategy.id, error
                     );
                 }
             }
         }
     }
 
+    fn flush_metrics(&mut self) {
+        let ts_ms = now_ms();
+        for strategy_index in 0..self.pending_metrics.len() {
+            let Some(metrics) = self.pending_metrics[strategy_index].take() else {
+                continue;
+            };
+            self.send_telemetry(StrategyTelemetryEvent::MetricsUpdated {
+                generation: self.telemetry_generation,
+                shard_id: self.shard_id.clone(),
+                strategy_id: self.strategies[strategy_index].strategy.id.clone(),
+                metrics,
+                ts_ms,
+            });
+        }
+    }
+
     fn prepare_plan_for_order(
         &self,
-        strategy: &StrategyRecord,
+        runtime: &RuntimeStrategy,
         plan: &StrategyOrderPlan,
     ) -> Option<StrategyOrderPlan> {
         // market rule 只在下单边界应用，撮合阶段保持纯深度计算。
-        let [long_market, short_market] = strategy_markets(strategy);
         let rules = self.market_rules.snapshot();
-        let Some(long_rule) = rules.get(&long_market) else {
+        let Some(long_rule) = rules.get(&runtime.long_market) else {
             warn!(
                 "{} strategy {} skip order: missing market rule for {}",
-                self.shard_id, strategy.id, long_market
+                self.shard_id, runtime.strategy.id, runtime.long_market
             );
             return None;
         };
-        let Some(short_rule) = rules.get(&short_market) else {
+        let Some(short_rule) = rules.get(&runtime.short_market) else {
             warn!(
                 "{} strategy {} skip order: missing market rule for {}",
-                self.shard_id, strategy.id, short_market
+                self.shard_id, runtime.strategy.id, runtime.short_market
             );
             return None;
         };
@@ -604,7 +630,7 @@ impl ShardRunner {
         ) {
             Ok(order) => order,
             Err(reason) => {
-                self.warn_order_reject(strategy, &long_market, reason);
+                self.warn_order_reject(&runtime.strategy, &runtime.long_market, reason);
                 return None;
             }
         };
@@ -616,7 +642,7 @@ impl ShardRunner {
         ) {
             Ok(order) => order,
             Err(reason) => {
-                self.warn_order_reject(strategy, &short_market, reason);
+                self.warn_order_reject(&runtime.strategy, &runtime.short_market, reason);
                 return None;
             }
         };

@@ -6,6 +6,7 @@ use crate::config::{
     ids::{AccountId, ClientOrderId, ConnectionId, ShardId, StrategyId},
     model::Exchange,
 };
+use crate::engine::book::RawDepthMessage;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -23,10 +24,7 @@ pub enum ShardEvent {
         /// 网关收到深度 payload 的进程内时间戳，只用于热路径耗时观测。
         #[serde(skip, default = "default_received_at")]
         received_at: Instant,
-        /// 深度 payload 已序列化/准备投递到撮合线程的时间戳。
-        #[serde(skip, default = "default_received_at")]
-        serialized_at: Instant,
-        payload: Vec<u8>,
+        message: RawDepthMessage,
     },
     OrderWsRaw {
         shard_id: ShardId,

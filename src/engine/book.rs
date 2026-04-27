@@ -2,11 +2,13 @@ mod codec;
 
 use std::cmp::Ordering;
 
+use serde::{Deserialize, Serialize};
+
 use crate::config::model::{DepthMode, MarketKey};
 
 pub use codec::decode_raw_depth;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PriceLevel {
     pub price: f64,
     pub qty: f64,
@@ -23,7 +25,7 @@ pub struct LocalBookState {
     asks_desc: Vec<PriceLevel>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum RawDepthMessage {
     Snapshot {
         market: MarketKey,
