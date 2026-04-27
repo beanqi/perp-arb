@@ -11,7 +11,7 @@ use tracing::{info, warn};
 use crate::{
     config::{
         ids::{AccountId, ConnectionId, ShardId, StrategyId},
-        model::{ActiveOrderView, BalanceView, MarketKey, PositionView, RuntimeCatalog, StrategyRecord},
+        model::{ActiveOrderView, BalanceView, MarketKey, PositionView, RuntimeCatalog, StrategyRecord, now_ms},
         planner::{RuntimePlan, ShardPlan, build_runtime_plan},
     },
     error::{AppError, AppResult},
@@ -21,7 +21,11 @@ use crate::{
 
 use super::{
     book::{BookApplyResult, LocalBookState, decode_raw_depth},
-    strategy::{StrategyRuntimeState, strategy_markets},
+    strategy::{StrategyAction, StrategyRuntimeState, strategy_markets},
+    telemetry::{
+        StrategyMatchEvent, StrategyMatchEventKind, StrategyRuntimeDescriptor, StrategyRuntimeSnapshot,
+        StrategyTelemetryEvent, StrategyTelemetryHub,
+    },
     types::{ShardEvent, TradeCommand},
 };
 
@@ -100,6 +104,7 @@ struct RuntimeRegistry {
 pub struct RuntimeManager {
     inner: RwLock<RuntimeRegistry>,
     market_rules: Arc<MarketRuleStore>,
+    telemetry: StrategyTelemetryHub,
 }
 
 impl RuntimeManager {
@@ -112,11 +117,21 @@ impl RuntimeManager {
                 route_by_connection: HashMap::new(),
             }),
             market_rules,
+            telemetry: StrategyTelemetryHub::spawn(),
         }
     }
 
     pub fn reload(&self, catalog: RuntimeCatalog) -> AppResult<RuntimeStatusView> {
         let plan = build_runtime_plan(&catalog.enabled_strategies);
+        let telemetry_generation = plan.generated_at_ms;
+        self.telemetry.publish_loaded(
+            telemetry_generation,
+            catalog
+                .enabled_strategies
+                .iter()
+                .map(strategy_descriptor)
+                .collect(),
+        );
         let mut route_by_connection = HashMap::new();
         let shard_mailboxes = plan
             .shards
@@ -126,6 +141,8 @@ impl RuntimeManager {
                     shard,
                     &plan,
                     &catalog.enabled_strategies,
+                    telemetry_generation,
+                    self.telemetry.sender(),
                     &mut route_by_connection,
                     self.market_rules.clone(),
                 )
@@ -226,10 +243,16 @@ impl RuntimeManager {
         Ok(self.status()?.active_orders)
     }
 
+    pub fn strategy_runtime_snapshot(&self) -> StrategyRuntimeSnapshot {
+        self.telemetry.snapshot().as_ref().clone()
+    }
+
     fn bootstrap_mailbox(
         shard: &ShardPlan,
         plan: &RuntimePlan,
         enabled_strategies: &[StrategyRecord],
+        telemetry_generation: u64,
+        telemetry_tx: Sender<StrategyTelemetryEvent>,
         route_by_connection: &mut HashMap<ConnectionId, Sender<ShardEvent>>,
         market_rules: Arc<MarketRuleStore>,
     ) -> ShardMailbox {
@@ -243,6 +266,8 @@ impl RuntimeManager {
             shard,
             plan,
             enabled_strategies,
+            telemetry_generation,
+            telemetry_tx,
             event_rx,
             command_tx.clone(),
             command_rx,
@@ -270,6 +295,8 @@ struct ShardRunner {
     strategies: HashMap<StrategyId, StrategyRecord>,
     strategies_by_market: HashMap<MarketKey, Vec<StrategyId>>,
     strategy_states: HashMap<StrategyId, StrategyRuntimeState>,
+    telemetry_generation: u64,
+    telemetry_tx: Sender<StrategyTelemetryEvent>,
     market_rules: Arc<MarketRuleStore>,
 }
 
@@ -278,6 +305,8 @@ impl ShardRunner {
         shard: &ShardPlan,
         plan: &RuntimePlan,
         enabled_strategies: &[StrategyRecord],
+        telemetry_generation: u64,
+        telemetry_tx: Sender<StrategyTelemetryEvent>,
         event_rx: Receiver<ShardEvent>,
         command_tx: Sender<TradeCommand>,
         command_rx: Receiver<TradeCommand>,
@@ -345,6 +374,8 @@ impl ShardRunner {
             strategies,
             strategies_by_market,
             strategy_states,
+            telemetry_generation,
+            telemetry_tx,
             market_rules,
         }
     }
@@ -459,18 +490,58 @@ impl ShardRunner {
             else {
                 continue;
             };
-            let Some(state) = self.strategy_states.get_mut(&strategy_id) else {
+            let Some((evaluation, open_spread_pct, close_spread_pct)) =
+                self.strategy_states.get_mut(&strategy_id).map(|state| {
+                    let evaluation = state.evaluate(
+                        &self.shard_id,
+                        strategy,
+                        long_book,
+                        short_book,
+                        long_rule,
+                        short_rule,
+                    );
+                    (
+                        evaluation,
+                        state.last_open_spread_pct,
+                        state.last_close_spread_pct,
+                    )
+                })
+            else {
                 continue;
             };
+            let ts_ms = now_ms();
+            self.send_telemetry(StrategyTelemetryEvent::MetricsUpdated {
+                generation: self.telemetry_generation,
+                shard_id: self.shard_id.clone(),
+                strategy_id: strategy_id.clone(),
+                metrics: evaluation.metrics,
+                ts_ms,
+            });
 
-            for command in state.evaluate(
-                &self.shard_id,
-                strategy,
-                long_book,
-                short_book,
-                long_rule,
-                short_rule,
-            ) {
+            if let Some(plan) = evaluation.planned_order {
+                let kind = match plan.action {
+                    StrategyAction::Open => StrategyMatchEventKind::OpenPlanned,
+                    StrategyAction::Close => StrategyMatchEventKind::ClosePlanned,
+                };
+                self.send_telemetry(StrategyTelemetryEvent::OrderPlanned {
+                    generation: self.telemetry_generation,
+                    event: StrategyMatchEvent {
+                        ts_ms,
+                        shard_id: self.shard_id.clone(),
+                        strategy_id: strategy_id.clone(),
+                        kind,
+                        open_spread_pct,
+                        close_spread_pct,
+                        notional_usd: Some(plan.notional_usd),
+                        message: format!(
+                            "{:?} planned notional={} long_qty={} short_qty={}",
+                            plan.action, plan.notional_usd, plan.long_qty, plan.short_qty
+                        ),
+                    },
+                });
+            }
+
+            for command in evaluation.commands {
                 if let Err(error) = self.command_tx.try_send(command) {
                     warn!(
                         "{} strategy {} failed to enqueue trade command: {}",
@@ -479,5 +550,22 @@ impl ShardRunner {
                 }
             }
         }
+    }
+
+    fn send_telemetry(&self, event: StrategyTelemetryEvent) {
+        if let Err(error) = self.telemetry_tx.try_send(event) {
+            warn!("{} strategy telemetry event dropped: {}", self.shard_id, error);
+        }
+    }
+}
+
+fn strategy_descriptor(strategy: &StrategyRecord) -> StrategyRuntimeDescriptor {
+    let [long_market, short_market] = strategy_markets(strategy);
+    StrategyRuntimeDescriptor {
+        strategy_id: strategy.id.clone(),
+        name: strategy.name.clone(),
+        enabled: strategy.enabled,
+        long_market,
+        short_market,
     }
 }

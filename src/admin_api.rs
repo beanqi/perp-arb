@@ -33,6 +33,7 @@ pub fn router(state: Arc<AppContext>) -> Router {
         .route("/api/accounts", get(list_accounts).post(upsert_account))
         .route("/api/runtime/status", get(runtime_status))
         .route("/api/runtime/plan", get(runtime_plan))
+        .route("/api/runtime/strategies", get(strategy_runtime))
         .route("/api/positions", get(positions))
         .route("/api/balances", get(balances))
         .route("/api/orders", get(active_orders))
@@ -90,6 +91,12 @@ async fn runtime_status(State(state): State<Arc<AppContext>>) -> AppResult<Json<
 
 async fn runtime_plan(State(state): State<Arc<AppContext>>) -> AppResult<Json<crate::config::planner::RuntimePlan>> {
     Ok(Json(state.runtime_plan()?))
+}
+
+async fn strategy_runtime(
+    State(state): State<Arc<AppContext>>,
+) -> Json<crate::engine::telemetry::StrategyRuntimeSnapshot> {
+    Json(state.strategy_runtime())
 }
 
 async fn positions(State(state): State<Arc<AppContext>>) -> AppResult<Json<Vec<crate::config::model::PositionView>>> {

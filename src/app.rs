@@ -19,7 +19,10 @@ use crate::{
         persist::FileStore,
         planner::RuntimePlan,
     },
-    engine::shard::{RuntimeManager, RuntimeStatusView},
+    engine::{
+        shard::{RuntimeManager, RuntimeStatusView},
+        telemetry::StrategyRuntimeSnapshot,
+    },
     error::{AppError, AppResult},
     market_rules::{
         DEFAULT_MARKET_RULE_REFRESH_INTERVAL, MarketRuleRefreshHandle, MarketRuleStore,
@@ -180,6 +183,10 @@ impl AppContext {
 
     pub fn runtime_plan(&self) -> AppResult<RuntimePlan> {
         Ok(self.runtime_status()?.plan)
+    }
+
+    pub fn strategy_runtime(&self) -> StrategyRuntimeSnapshot {
+        self.runtime.strategy_runtime_snapshot()
     }
 
     pub fn positions(&self) -> AppResult<Vec<PositionView>> {

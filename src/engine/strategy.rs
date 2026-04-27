@@ -10,6 +10,8 @@ use crate::{
     market_rules::MarketRule,
 };
 
+use super::telemetry::StrategyRuntimeMetrics;
+
 pub const MAX_MATCH_LEVELS: usize = 10;
 
 #[derive(Clone, Debug, Default)]
@@ -41,6 +43,13 @@ pub struct StrategyOrderPlan {
     pub short_limit_price: f64,
 }
 
+#[derive(Clone, Debug)]
+pub struct StrategyEvaluation {
+    pub commands: Vec<TradeCommand>,
+    pub planned_order: Option<StrategyOrderPlan>,
+    pub metrics: StrategyRuntimeMetrics,
+}
+
 impl StrategyRuntimeState {
     pub fn new(strategy_id: StrategyId) -> Self {
         Self {
@@ -57,22 +66,47 @@ impl StrategyRuntimeState {
         short_book: &LocalBookState,
         long_rule: &MarketRule,
         short_rule: &MarketRule,
-    ) -> Vec<TradeCommand> {
+    ) -> StrategyEvaluation {
         if self.active_order_count + 2 > strategy.max_open_orders {
-            return Vec::new();
+            return self.evaluation(Vec::new(), None);
         }
 
         let close_plan = self.close_plan(strategy, long_book, short_book, long_rule, short_rule);
         if let Some(plan) = close_plan {
-            return self.commands_for_plan(shard_id, strategy, plan);
+            let commands = self.commands_for_plan(shard_id, strategy, &plan);
+            return self.evaluation(commands, Some(plan));
         }
 
         let open_plan = self.open_plan(strategy, long_book, short_book, long_rule, short_rule);
         if let Some(plan) = open_plan {
-            return self.commands_for_plan(shard_id, strategy, plan);
+            let commands = self.commands_for_plan(shard_id, strategy, &plan);
+            return self.evaluation(commands, Some(plan));
         }
 
-        Vec::new()
+        self.evaluation(Vec::new(), None)
+    }
+
+    pub fn metrics(&self) -> StrategyRuntimeMetrics {
+        StrategyRuntimeMetrics {
+            open_spread_pct: self.last_open_spread_pct,
+            close_spread_pct: self.last_close_spread_pct,
+            current_pair_notional: self.current_pair_notional,
+            pending_open_notional: self.pending_open_notional,
+            pending_close_notional: self.pending_close_notional,
+            active_order_count: self.active_order_count,
+        }
+    }
+
+    fn evaluation(
+        &self,
+        commands: Vec<TradeCommand>,
+        planned_order: Option<StrategyOrderPlan>,
+    ) -> StrategyEvaluation {
+        StrategyEvaluation {
+            commands,
+            planned_order,
+            metrics: self.metrics(),
+        }
     }
 
     fn open_plan(
@@ -158,7 +192,7 @@ impl StrategyRuntimeState {
         &mut self,
         shard_id: &ShardId,
         strategy: &StrategyRecord,
-        plan: StrategyOrderPlan,
+        plan: &StrategyOrderPlan,
     ) -> Vec<TradeCommand> {
         self.active_order_count += 2;
         match plan.action {

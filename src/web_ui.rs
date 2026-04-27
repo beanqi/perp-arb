@@ -148,6 +148,53 @@ pub fn index_html() -> &'static str {
         color: var(--danger);
       }
 
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 14px;
+      }
+
+      th,
+      td {
+        border-bottom: 1px solid var(--line);
+        padding: 8px 6px;
+        text-align: left;
+        vertical-align: top;
+      }
+
+      th {
+        color: var(--muted);
+        font-weight: 600;
+      }
+
+      .mono {
+        font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        white-space: pre-line;
+      }
+
+      .profit {
+        color: var(--accent-dark);
+        font-weight: 700;
+      }
+
+      .loss {
+        color: var(--danger);
+      }
+
+      .events {
+        display: grid;
+        gap: 8px;
+        max-height: 260px;
+        overflow: auto;
+      }
+
+      .event {
+        border-bottom: 1px solid var(--line);
+        padding-bottom: 8px;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
       @media (max-width: 820px) {
         .grid {
           grid-template-columns: 1fr;
@@ -212,8 +259,13 @@ pub fn index_html() -> &'static str {
         </article>
 
         <article class="panel">
-          <h2>策略列表</h2>
-          <pre id="strategies">loading...</pre>
+          <h2>策略实时视图</h2>
+          <div id="strategies">loading...</div>
+        </article>
+
+        <article class="panel">
+          <h2>撮合消息</h2>
+          <div id="match-events" class="events">loading...</div>
         </article>
 
         <article class="panel">
@@ -270,6 +322,8 @@ pub fn index_html() -> &'static str {
       };
 
       $("strategy-json").value = JSON.stringify(defaultStrategy, null, 2);
+      let cachedStrategies = [];
+      let lastRuntime = { strategies: [], match_events: [] };
 
       function showStatus(message, isError = false) {
         status.textContent = message;
@@ -289,17 +343,95 @@ pub fn index_html() -> &'static str {
         return data;
       }
 
+      function pct(value) {
+        if (value === null || value === undefined) return "-";
+        return `${Number(value).toFixed(4)}%`;
+      }
+
+      function number(value) {
+        if (value === null || value === undefined) return "-";
+        return Number(value).toFixed(4);
+      }
+
+      function setCell(row, text, className = "") {
+        const cell = document.createElement("td");
+        cell.textContent = text;
+        if (className) cell.className = className;
+        row.appendChild(cell);
+      }
+
+      function renderStrategies() {
+        const runtimeById = new Map((lastRuntime.strategies || []).map((item) => [item.strategy_id, item]));
+        const table = document.createElement("table");
+        const head = document.createElement("thead");
+        head.innerHTML = "<tr><th>策略</th><th>状态</th><th>开仓利润率</th><th>平仓利润率</th><th>仓位/挂单</th><th>市场</th></tr>";
+        table.appendChild(head);
+        const body = document.createElement("tbody");
+
+        cachedStrategies.forEach((strategy) => {
+          const live = runtimeById.get(strategy.id);
+          const row = document.createElement("tr");
+          setCell(row, `${strategy.name}\n${strategy.id}`, "mono");
+          setCell(row, strategy.enabled ? "enabled" : "disabled");
+          setCell(row, pct(live?.open_spread_pct), live?.open_spread_pct >= 0 ? "profit mono" : "loss mono");
+          setCell(row, pct(live?.close_spread_pct), live?.close_spread_pct >= 0 ? "profit mono" : "loss mono");
+          setCell(
+            row,
+            `pos ${number(live?.current_pair_notional)}\nopen ${number(live?.pending_open_notional)} / close ${number(live?.pending_close_notional)}\norders ${live?.active_order_count ?? 0}`,
+            "mono"
+          );
+          setCell(
+            row,
+            `${strategy.long_leg.exchange}:${strategy.long_leg.symbol}\n${strategy.short_leg.exchange}:${strategy.short_leg.symbol}`,
+            "mono"
+          );
+          body.appendChild(row);
+        });
+
+        if (cachedStrategies.length === 0) {
+          const row = document.createElement("tr");
+          setCell(row, "no strategy configured");
+          body.appendChild(row);
+        }
+
+        table.appendChild(body);
+        $("strategies").replaceChildren(table);
+      }
+
+      function renderMatchEvents() {
+        const events = [...(lastRuntime.match_events || [])].reverse();
+        const container = $("match-events");
+        container.replaceChildren();
+        if (events.length === 0) {
+          container.textContent = "no match event yet";
+          return;
+        }
+        events.slice(0, 30).forEach((event) => {
+          const item = document.createElement("div");
+          item.className = "event mono";
+          item.textContent = `${new Date(event.ts_ms).toLocaleTimeString()} ${event.strategy_id} ${event.kind} ${event.notional_usd ?? ""} ${event.message}`;
+          container.appendChild(item);
+        });
+      }
+
+      async function refreshRuntime() {
+        lastRuntime = await requestJson("/api/runtime/strategies");
+        renderStrategies();
+        renderMatchEvents();
+      }
+
       async function refresh() {
         const [strategies, accounts, plan] = await Promise.all([
           requestJson("/api/strategies"),
           requestJson("/api/accounts"),
           requestJson("/api/runtime/plan")
         ]);
-        $("strategies").textContent = JSON.stringify(strategies, null, 2);
+        cachedStrategies = strategies;
         $("accounts").textContent = JSON.stringify(accounts, null, 2);
         $("plan").textContent = plan
           ? `${plan.total_enabled_strategies} enabled strategies\n${JSON.stringify(plan, null, 2)}`
           : "{}";
+        await refreshRuntime();
       }
 
       $("seed-bybit").addEventListener("click", () => {
@@ -374,6 +506,9 @@ pub fn index_html() -> &'static str {
       });
 
       refresh().catch((error) => showStatus(error.message, true));
+      setInterval(() => {
+        refreshRuntime().catch((error) => showStatus(error.message, true));
+      }, 1000);
     </script>
   </body>
 </html>"#
