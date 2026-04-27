@@ -459,8 +459,8 @@ impl ShardRunner {
                         self.shard_id, self.books[book_index].market
                     );
                 } else if result == BookApplyResult::Applied {
-                    self.evaluate_book(book_index);
                     let serialize_elapsed = serialized_at.saturating_duration_since(received_at);
+                    self.evaluate_book(book_index);
                     let match_elapsed = received_at.elapsed();
                     info!(
                         "{} market {} depth latency serialize_us={} match_us={}",
