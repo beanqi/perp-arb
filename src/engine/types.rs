@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use serde::{Deserialize, Serialize};
 
 use crate::config::{
@@ -20,6 +22,8 @@ pub enum ShardEvent {
     MarketWsRaw {
         connection_id: ConnectionId,
         message: RawDepthMessage,
+        #[serde(skip, default = "now_instant")]
+        received_at: Instant,
     },
     OrderWsRaw {
         shard_id: ShardId,
@@ -50,6 +54,10 @@ pub enum ShardEvent {
     Shutdown {
         shard_id: ShardId,
     },
+}
+
+fn now_instant() -> Instant {
+    Instant::now()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

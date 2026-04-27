@@ -1,4 +1,7 @@
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use crossbeam_channel::Sender;
 use futures_util::{SinkExt, StreamExt};
@@ -74,9 +77,10 @@ async fn run_once(
             message = read.next() => {
                 let message = message.ok_or_else(|| "websocket stream ended".to_owned())?
                     .map_err(|error| format!("websocket read failed: {error}"))?;
+                let received_at = Instant::now();
                 match message {
-                    Message::Text(text) => synchronizer.handle_payload(text.as_bytes(), shard_tx)?,
-                    Message::Binary(bytes) => synchronizer.handle_payload(&bytes, shard_tx)?,
+                    Message::Text(text) => synchronizer.handle_payload(text.as_bytes(), received_at, shard_tx)?,
+                    Message::Binary(bytes) => synchronizer.handle_payload(&bytes, received_at, shard_tx)?,
                     Message::Ping(payload) => write.send(Message::Pong(payload)).await.map_err(|error| format!("pong failed: {error}"))?,
                     Message::Close(frame) => return Err(format!("remote close: {frame:?}")),
                     Message::Pong(_) | Message::Frame(_) => {}
@@ -127,6 +131,7 @@ impl BybitDepthSynchronizer {
     fn handle_payload(
         &mut self,
         payload: &[u8],
+        received_at: Instant,
         shard_tx: &Sender<ShardEvent>,
     ) -> Result<(), String> {
         let Some(message) = decode_raw_depth(self.runtime.exchange, payload) else {
@@ -153,6 +158,7 @@ impl BybitDepthSynchronizer {
             .try_send(ShardEvent::MarketWsRaw {
                 connection_id: self.runtime.connection_id.clone(),
                 message,
+                received_at,
             })
             .map_err(|error| format!("shard queue send failed: {error}"))
     }

@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     sync::{Arc, RwLock},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use crossbeam_channel::{Receiver, Sender, bounded, tick};
@@ -441,13 +441,16 @@ impl ShardRunner {
     fn handle_event(&mut self, event: ShardEvent) {
         match event {
             ShardEvent::MarketWsRaw {
-                message, ..
+                message,
+                received_at,
+                ..
             } => {
                 let market = message.market().clone();
                 if let Some(&book_idx) = self.book_by_market.get(&market)
                     && let Some(book) = self.books.get_mut(book_idx)
                 {
                     let result = book.apply(message);
+                    let depth_receive_elapsed = received_at.elapsed();
                     // let (bid_depth, ask_depth) = book.level_counts();
                     // info!(
                     //     "{} market {} depth applied result={:?} best_bid={:?} best_ask={:?} bid_depth={} ask_depth={}",
@@ -465,7 +468,18 @@ impl ShardRunner {
                             self.shard_id, market
                         );
                     } else if result == BookApplyResult::Applied {
-                        self.evaluate_market(&market);
+                        let match_started_at = Instant::now();
+                        let commands = self.evaluate_market(&market);
+                        let match_elapsed = match_started_at.elapsed();
+                        info!(
+                            "{} market {} perf depth_receive_us={} match_us={} order_command_count={}",
+                            self.shard_id,
+                            market,
+                            depth_receive_elapsed.as_micros(),
+                            match_elapsed.as_micros(),
+                            commands.len()
+                        );
+                        self.enqueue_trade_commands(commands);
                     }
                 }
             }
@@ -509,19 +523,19 @@ impl ShardRunner {
         }
     }
 
-    fn evaluate_market(&mut self, market: &MarketKey) {
+    fn evaluate_market(&mut self, market: &MarketKey) -> Vec<TradeCommand> {
         let Some(strategy_indexes) = self.strategies_by_market.get(market) else {
-            return;
+            return Vec::new();
         };
 
         let books = &self.books;
         let strategies = &mut self.strategies;
         let pending_metrics = &mut self.pending_metrics;
-        let command_tx = &self.command_tx;
         let telemetry_tx = &self.telemetry_tx;
         let market_rules = &self.market_rules;
         let shard_id = &self.shard_id;
         let telemetry_generation = self.telemetry_generation;
+        let mut order_commands = Vec::new();
 
         for &strategy_idx in strategy_indexes.iter() {
             let Some(runtime_strategy) = strategies.get_mut(strategy_idx) else {
@@ -592,13 +606,20 @@ impl ShardRunner {
                 );
             }
 
-            for command in commands {
-                if let Err(error) = command_tx.try_send(command) {
-                    warn!(
-                        "{} strategy {} failed to enqueue trade command: {}",
-                        shard_id, runtime_strategy.record.id, error
-                    );
-                }
+            order_commands.extend(commands);
+        }
+
+        order_commands
+    }
+
+    fn enqueue_trade_commands(&self, commands: Vec<TradeCommand>) {
+        for command in commands {
+            let strategy_id = trade_command_strategy_id(&command).clone();
+            if let Err(error) = self.command_tx.try_send(command) {
+                warn!(
+                    "{} strategy {} failed to enqueue trade command: {}",
+                    self.shard_id, strategy_id, error
+                );
             }
         }
     }
@@ -715,6 +736,14 @@ fn send_telemetry(
 ) {
     if let Err(error) = telemetry_tx.try_send(event) {
         warn!("{} strategy telemetry event dropped: {}", shard_id, error);
+    }
+}
+
+fn trade_command_strategy_id(command: &TradeCommand) -> &StrategyId {
+    match command {
+        TradeCommand::PlaceOrder { strategy_id, .. }
+        | TradeCommand::CancelOrder { strategy_id, .. }
+        | TradeCommand::QueryOrder { strategy_id, .. } => strategy_id,
     }
 }
 

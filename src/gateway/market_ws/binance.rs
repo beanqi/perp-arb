@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
 use futures_util::{SinkExt, StreamExt};
@@ -64,9 +64,10 @@ async fn run_once(
             message = read.next() => {
                 let message = message.ok_or_else(|| "websocket stream ended".to_owned())?
                     .map_err(|error| format!("websocket read failed: {error}"))?;
+                let received_at = Instant::now();
                 match message {
-                    Message::Text(text) => synchronizer.handle_payload(text.as_bytes(), shard_tx).await?,
-                    Message::Binary(bytes) => synchronizer.handle_payload(&bytes, shard_tx).await?,
+                    Message::Text(text) => synchronizer.handle_payload(text.as_bytes(), received_at, shard_tx).await?,
+                    Message::Binary(bytes) => synchronizer.handle_payload(&bytes, received_at, shard_tx).await?,
                     Message::Ping(payload) => write.send(Message::Pong(payload)).await.map_err(|error| format!("pong failed: {error}"))?,
                     Message::Close(frame) => return Err(format!("remote close: {frame:?}")),
                     Message::Pong(_) | Message::Frame(_) => {}
