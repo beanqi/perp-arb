@@ -99,51 +99,75 @@ impl DepthSynchronizer {
         symbol: &str,
         shard_tx: &Sender<ShardEvent>,
     ) -> Result<(), String> {
-        if self
-            .states
-            .get(symbol)
-            .ok_or_else(|| format!("missing sync state for {symbol}"))?
-            .snapshot
-            .is_none()
-        {
-            let snapshot = fetch_snapshot(&self.client, symbol).await?;
-            info!(
-                "market ws {} binance symbol={} snapshot fetched last_update_id={} bids={} asks={}",
-                self.runtime.connection_id,
-                symbol,
-                snapshot.last_update_id,
-                snapshot.bids.len(),
-                snapshot.asks.len()
-            );
+        let (last_update_id, first_delta_index) = loop {
+            if self
+                .states
+                .get(symbol)
+                .ok_or_else(|| format!("missing sync state for {symbol}"))?
+                .snapshot
+                .is_none()
+            {
+                let snapshot = fetch_snapshot(&self.client, symbol).await?;
+                info!(
+                    "market ws {} binance symbol={} snapshot fetched last_update_id={} bids={} asks={}",
+                    self.runtime.connection_id,
+                    symbol,
+                    snapshot.last_update_id,
+                    snapshot.bids.len(),
+                    snapshot.asks.len()
+                );
+                let state = self
+                    .states
+                    .get_mut(symbol)
+                    .ok_or_else(|| format!("missing sync state for {symbol}"))?;
+                state.snapshot = Some(snapshot);
+            }
+
             let state = self
                 .states
                 .get_mut(symbol)
                 .ok_or_else(|| format!("missing sync state for {symbol}"))?;
-            state.snapshot = Some(snapshot);
-        }
+            let last_update_id = state
+                .snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.last_update_id)
+                .ok_or_else(|| format!("missing snapshot for {symbol}"))?;
+            match state.snapshot_bridge(last_update_id) {
+                SnapshotBridge::Ready { first_delta_index } => {
+                    break (last_update_id, first_delta_index);
+                }
+                SnapshotBridge::Waiting => {
+                    warn!(
+                        "market ws {} binance symbol={} waiting snapshot bridge last_update_id={} pending_deltas={}",
+                        self.runtime.connection_id,
+                        symbol,
+                        last_update_id,
+                        state.pending.len()
+                    );
+                    return Ok(());
+                }
+                SnapshotBridge::SnapshotBehind {
+                    first_sequence,
+                    target_sequence,
+                } => {
+                    warn!(
+                        "market ws {} binance symbol={} snapshot behind buffered deltas; refetching snapshot last_update_id={} target_sequence={} first_pending_sequence={} pending_deltas={}",
+                        self.runtime.connection_id,
+                        symbol,
+                        last_update_id,
+                        target_sequence,
+                        first_sequence,
+                        state.pending.len()
+                    );
+                    state.snapshot = None;
+                }
+            }
+        };
 
         let state = self
             .states
             .get_mut(symbol)
             .ok_or_else(|| format!("missing sync state for {symbol}"))?;
-        let last_update_id = state
-            .snapshot
-            .as_ref()
-            .map(|snapshot| snapshot.last_update_id)
-            .ok_or_else(|| format!("missing snapshot for {symbol}"))?;
-        state.discard_stale(last_update_id);
-
-        let Some(first_delta_index) = state.find_snapshot_bridge(last_update_id) else {
-            warn!(
-                "market ws {} binance symbol={} waiting snapshot bridge last_update_id={} pending_deltas={}",
-                self.runtime.connection_id,
-                symbol,
-                last_update_id,
-                state.pending.len()
-            );
-            return Ok(());
-        };
-
         let snapshot_received_at = state
             .pending
             .get(first_delta_index)
@@ -224,6 +248,18 @@ struct TimedDepthMessage {
     timing: DepthEventTiming,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SnapshotBridge {
+    Ready {
+        first_delta_index: usize,
+    },
+    Waiting,
+    SnapshotBehind {
+        first_sequence: u64,
+        target_sequence: u64,
+    },
+}
+
 impl SymbolSyncState {
     fn new() -> Self {
         Self {
@@ -240,24 +276,43 @@ impl SymbolSyncState {
 
     fn discard_stale(&mut self, last_update_id: u64) {
         self.pending.retain(|timed| match &timed.message {
-            RawDepthMessage::Delta { sequence, .. } => sequence.is_none_or(|value| value > last_update_id),
+            RawDepthMessage::Delta { sequence, .. } => {
+                sequence.is_none_or(|value| value > last_update_id)
+            }
             RawDepthMessage::Snapshot { .. } => false,
         });
     }
 
-    fn find_snapshot_bridge(&self, last_update_id: u64) -> Option<usize> {
-        self.pending.iter().position(|timed| match &timed.message {
-            RawDepthMessage::Delta {
+    fn snapshot_bridge(&mut self, last_update_id: u64) -> SnapshotBridge {
+        self.discard_stale(last_update_id);
+        let target_sequence = last_update_id.saturating_add(1);
+        for (index, timed) in self.pending.iter().enumerate() {
+            let RawDepthMessage::Delta {
                 first_sequence,
                 sequence,
                 ..
-            } => {
-                let first = first_sequence.unwrap_or(u64::MAX);
-                let current = sequence.unwrap_or(0);
-                first <= last_update_id + 1 && current >= last_update_id + 1
+            } = &timed.message
+            else {
+                continue;
+            };
+            let Some(first_sequence) = *first_sequence else {
+                continue;
+            };
+            // Binance 初始化要求第一条可用增量覆盖 last_update_id + 1；如果
+            // pending 已经越过目标，当前 snapshot 永远无法桥接，只能重拉。
+            if first_sequence > target_sequence {
+                return SnapshotBridge::SnapshotBehind {
+                    first_sequence,
+                    target_sequence,
+                };
             }
-            RawDepthMessage::Snapshot { .. } => false,
-        })
+            if sequence.is_some_and(|value| value >= target_sequence) {
+                return SnapshotBridge::Ready {
+                    first_delta_index: index,
+                };
+            }
+        }
+        SnapshotBridge::Waiting
     }
 
     fn mark_ready_and_drain_from(&mut self, index: usize) -> Vec<TimedDepthMessage> {
@@ -363,4 +418,60 @@ fn parse_snapshot_level(level: [String; 2]) -> Option<PriceLevel> {
         price: level[0].parse().ok()?,
         qty: level[1].parse().ok()?,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_bridge_reports_snapshot_behind_when_pending_starts_after_target() {
+        let mut state = SymbolSyncState::new();
+        state.buffer(delta(110, 120));
+
+        assert_eq!(
+            state.snapshot_bridge(100),
+            SnapshotBridge::SnapshotBehind {
+                first_sequence: 110,
+                target_sequence: 101,
+            }
+        );
+    }
+
+    #[test]
+    fn snapshot_bridge_waits_without_pending_delta() {
+        let mut state = SymbolSyncState::new();
+
+        assert_eq!(state.snapshot_bridge(100), SnapshotBridge::Waiting);
+    }
+
+    #[test]
+    fn snapshot_bridge_discards_stale_and_returns_bridge() {
+        let mut state = SymbolSyncState::new();
+        state.buffer(delta(90, 100));
+        state.buffer(delta(100, 101));
+
+        assert_eq!(
+            state.snapshot_bridge(100),
+            SnapshotBridge::Ready {
+                first_delta_index: 0
+            }
+        );
+        assert_eq!(state.pending.len(), 1);
+    }
+
+    fn delta(first_sequence: u64, sequence: u64) -> TimedDepthMessage {
+        TimedDepthMessage {
+            message: RawDepthMessage::Delta {
+                market: MarketKey::new(Exchange::BinanceUsdM, "BTCUSDT"),
+                first_sequence: Some(first_sequence),
+                previous_sequence: None,
+                sequence: Some(sequence),
+                bids: Vec::new(),
+                asks: Vec::new(),
+            },
+            received_at: Instant::now(),
+            timing: DepthEventTiming::default(),
+        }
+    }
 }
