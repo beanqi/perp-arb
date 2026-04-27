@@ -1,4 +1,7 @@
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use crossbeam_channel::Sender;
 use futures_util::{SinkExt, StreamExt};
@@ -123,6 +126,7 @@ impl BybitDepthSynchronizer {
         payload: &[u8],
         shard_tx: &Sender<ShardEvent>,
     ) -> Result<(), String> {
+        let received_at = Instant::now();
         let Some(message) = decode_raw_depth(self.runtime.exchange, payload) else {
             return Ok(());
         };
@@ -143,11 +147,15 @@ impl BybitDepthSynchronizer {
             return Ok(());
         }
 
+        let payload = payload.to_vec();
+        let serialized_at = Instant::now();
         shard_tx
             .try_send(ShardEvent::MarketWsRaw {
                 connection_id: self.runtime.connection_id.clone(),
                 exchange: self.runtime.exchange,
-                payload: payload.to_vec(),
+                received_at,
+                serialized_at,
+                payload,
             })
             .map_err(|error| format!("shard queue send failed: {error}"))
     }

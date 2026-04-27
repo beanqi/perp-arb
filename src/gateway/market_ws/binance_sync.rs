@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Instant};
 
 use crossbeam_channel::Sender;
 use reqwest::Client;
@@ -44,6 +44,7 @@ impl DepthSynchronizer {
         payload: &[u8],
         shard_tx: &Sender<ShardEvent>,
     ) -> Result<(), String> {
+        let received_at = Instant::now();
         let Some(message) = decode_raw_depth(self.runtime.exchange, payload) else {
             return Ok(());
         };
@@ -58,7 +59,7 @@ impl DepthSynchronizer {
         let Some(state) = self.states.get_mut(&symbol) else {
             return Ok(());
         };
-        state.buffer(message);
+        state.buffer(message, received_at);
 
         if !state.ready {
             self.initialize_symbol(&symbol, shard_tx).await?;
@@ -76,7 +77,7 @@ impl DepthSynchronizer {
         }
 
         while let Some(message) = state.pop_ready_delta() {
-            send_depth_message(&self.runtime, shard_tx, message)?;
+            send_depth_message(&self.runtime, shard_tx, message.message, message.received_at)?;
         }
         Ok(())
     }
@@ -145,10 +146,11 @@ impl DepthSynchronizer {
                 bids: snapshot.bids.into_iter().filter_map(parse_snapshot_level).collect(),
                 asks: snapshot.asks.into_iter().filter_map(parse_snapshot_level).collect(),
             },
+            Instant::now(),
         )?;
 
         for delta in state.mark_ready_and_drain_from(first_delta_index) {
-            send_depth_message(&self.runtime, shard_tx, delta)?;
+            send_depth_message(&self.runtime, shard_tx, delta.message, delta.received_at)?;
         }
         info!(
             "market ws {} binance symbol={} depth synchronized last_update_id={}",
@@ -166,11 +168,16 @@ impl DepthSynchronizer {
     }
 }
 
+struct PendingDepthMessage {
+    message: RawDepthMessage,
+    received_at: Instant,
+}
+
 struct SymbolSyncState {
     ready: bool,
     last_sequence: Option<u64>,
     snapshot: Option<BinanceSnapshot>,
-    pending: Vec<RawDepthMessage>,
+    pending: Vec<PendingDepthMessage>,
 }
 
 impl SymbolSyncState {
@@ -183,19 +190,22 @@ impl SymbolSyncState {
         }
     }
 
-    fn buffer(&mut self, message: RawDepthMessage) {
-        self.pending.push(message);
+    fn buffer(&mut self, message: RawDepthMessage, received_at: Instant) {
+        self.pending.push(PendingDepthMessage {
+            message,
+            received_at,
+        });
     }
 
     fn discard_stale(&mut self, last_update_id: u64) {
-        self.pending.retain(|message| match message {
+        self.pending.retain(|message| match &message.message {
             RawDepthMessage::Delta { sequence, .. } => sequence.is_none_or(|value| value > last_update_id),
             RawDepthMessage::Snapshot { .. } => false,
         });
     }
 
     fn find_snapshot_bridge(&self, last_update_id: u64) -> Option<usize> {
-        self.pending.iter().position(|message| match message {
+        self.pending.iter().position(|message| match &message.message {
             RawDepthMessage::Delta {
                 first_sequence,
                 sequence,
@@ -209,17 +219,17 @@ impl SymbolSyncState {
         })
     }
 
-    fn mark_ready_and_drain_from(&mut self, index: usize) -> Vec<RawDepthMessage> {
+    fn mark_ready_and_drain_from(&mut self, index: usize) -> Vec<PendingDepthMessage> {
         self.ready = true;
         self.pending.drain(..index).for_each(drop);
         self.record_pending_sequences();
         self.pending.drain(..).collect()
     }
 
-    fn pop_ready_delta(&mut self) -> Option<RawDepthMessage> {
+    fn pop_ready_delta(&mut self) -> Option<PendingDepthMessage> {
         if self.ready && !self.pending.is_empty() {
             let message = self.pending.remove(0);
-            if let RawDepthMessage::Delta { sequence, .. } = &message {
+            if let RawDepthMessage::Delta { sequence, .. } = &message.message {
                 self.last_sequence = sequence.or(self.last_sequence);
             }
             Some(message)
@@ -235,7 +245,7 @@ impl SymbolSyncState {
                 previous_sequence,
                 sequence,
                 ..
-            } = message
+            } = &message.message
             else {
                 continue;
             };
@@ -251,7 +261,7 @@ impl SymbolSyncState {
 
     fn record_pending_sequences(&mut self) {
         for message in &self.pending {
-            if let RawDepthMessage::Delta { sequence, .. } = message {
+            if let RawDepthMessage::Delta { sequence, .. } = &message.message {
                 self.last_sequence = sequence.or(self.last_sequence);
             }
         }
@@ -269,12 +279,16 @@ fn send_depth_message(
     runtime: &MarketWsRuntime,
     shard_tx: &Sender<ShardEvent>,
     message: RawDepthMessage,
+    received_at: Instant,
 ) -> Result<(), String> {
     let payload = encode_depth_message(message)?;
+    let serialized_at = Instant::now();
     shard_tx
         .try_send(ShardEvent::MarketWsRaw {
             connection_id: runtime.connection_id.clone(),
             exchange: runtime.exchange,
+            received_at,
+            serialized_at,
             payload,
         })
         .map_err(|error| format!("shard queue send failed: {error}"))

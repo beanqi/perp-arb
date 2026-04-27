@@ -398,7 +398,11 @@ impl ShardRunner {
     fn handle_event(&mut self, event: ShardEvent) {
         match event {
             ShardEvent::MarketWsRaw {
-                exchange, payload, ..
+                exchange,
+                received_at,
+                serialized_at,
+                payload,
+                ..
             } => {
                 if let Some(message) = decode_raw_depth(exchange, &payload) {
                     let market = message.market().clone();
@@ -422,6 +426,15 @@ impl ShardRunner {
                             );
                         } else if result == BookApplyResult::Applied {
                             self.evaluate_market(&market);
+                            let serialize_elapsed = serialized_at.saturating_duration_since(received_at);
+                            let match_elapsed = received_at.elapsed();
+                            info!(
+                                "{} market {} depth latency serialize_us={} match_us={}",
+                                self.shard_id,
+                                market,
+                                serialize_elapsed.as_micros(),
+                                match_elapsed.as_micros()
+                            );
                         }
                     }
                 }
