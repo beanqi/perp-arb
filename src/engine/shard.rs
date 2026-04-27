@@ -11,7 +11,7 @@ use tracing::{info, warn};
 use crate::{
     config::{
         ids::{AccountId, ConnectionId, ShardId, StrategyId},
-        model::{ActiveOrderView, BalanceView, MarketKey, PositionView, RuntimeCatalog},
+        model::{ActiveOrderView, BalanceView, MarketKey, PositionView, RuntimeCatalog, StrategyRecord},
         planner::{RuntimePlan, ShardPlan, build_runtime_plan},
     },
     error::{AppError, AppResult},
@@ -21,6 +21,7 @@ use crate::{
 
 use super::{
     book::{BookApplyResult, LocalBookState, decode_raw_depth},
+    strategy::{StrategyRuntimeState, strategy_markets},
     types::{ShardEvent, TradeCommand},
 };
 
@@ -124,6 +125,7 @@ impl RuntimeManager {
                 Self::bootstrap_mailbox(
                     shard,
                     &plan,
+                    &catalog.enabled_strategies,
                     &mut route_by_connection,
                     self.market_rules.clone(),
                 )
@@ -227,6 +229,7 @@ impl RuntimeManager {
     fn bootstrap_mailbox(
         shard: &ShardPlan,
         plan: &RuntimePlan,
+        enabled_strategies: &[StrategyRecord],
         route_by_connection: &mut HashMap<ConnectionId, Sender<ShardEvent>>,
         market_rules: Arc<MarketRuleStore>,
     ) -> ShardMailbox {
@@ -239,7 +242,9 @@ impl RuntimeManager {
         let runner = ShardRunner::from_plan(
             shard,
             plan,
+            enabled_strategies,
             event_rx,
+            command_tx.clone(),
             command_rx,
             market_rules,
         );
@@ -259,8 +264,12 @@ impl RuntimeManager {
 struct ShardRunner {
     shard_id: ShardId,
     event_rx: Receiver<ShardEvent>,
+    command_tx: Sender<TradeCommand>,
     command_rx: Receiver<TradeCommand>,
     books: HashMap<MarketKey, LocalBookState>,
+    strategies: HashMap<StrategyId, StrategyRecord>,
+    strategies_by_market: HashMap<MarketKey, Vec<StrategyId>>,
+    strategy_states: HashMap<StrategyId, StrategyRuntimeState>,
     market_rules: Arc<MarketRuleStore>,
 }
 
@@ -268,7 +277,9 @@ impl ShardRunner {
     fn from_plan(
         shard: &ShardPlan,
         plan: &RuntimePlan,
+        enabled_strategies: &[StrategyRecord],
         event_rx: Receiver<ShardEvent>,
+        command_tx: Sender<TradeCommand>,
         command_rx: Receiver<TradeCommand>,
         market_rules: Arc<MarketRuleStore>,
     ) -> Self {
@@ -295,12 +306,45 @@ impl ShardRunner {
                 (market.clone(), LocalBookState::new(market.clone(), mode))
             })
             .collect();
+        let shard_strategy_ids = shard
+            .strategy_ids
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        let strategies = enabled_strategies
+            .iter()
+            .filter(|strategy| shard_strategy_ids.contains(&strategy.id))
+            .map(|strategy| (strategy.id.clone(), strategy.clone()))
+            .collect::<HashMap<_, _>>();
+        let strategy_states = strategies
+            .keys()
+            .cloned()
+            .map(|strategy_id| {
+                (
+                    strategy_id.clone(),
+                    StrategyRuntimeState::new(strategy_id),
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let mut strategies_by_market = HashMap::<MarketKey, Vec<StrategyId>>::new();
+        for strategy in strategies.values() {
+            for market in strategy_markets(strategy) {
+                strategies_by_market
+                    .entry(market)
+                    .or_default()
+                    .push(strategy.id.clone());
+            }
+        }
 
         Self {
             shard_id: shard.shard_id.clone(),
             event_rx,
+            command_tx,
             command_rx,
             books,
+            strategies,
+            strategies_by_market,
+            strategy_states,
             market_rules,
         }
     }
@@ -345,6 +389,8 @@ impl ShardRunner {
                                 "{} market {} depth gap detected; waiting for gateway rebuild",
                                 self.shard_id, market
                             );
+                        } else if result == BookApplyResult::Applied {
+                            self.evaluate_market(&market);
                         }
                     }
                 }
@@ -385,6 +431,52 @@ impl ShardRunner {
                     "{} order market={} has no cached market rule yet",
                     self.shard_id, market
                 ),
+            }
+        }
+    }
+
+    fn evaluate_market(&mut self, market: &MarketKey) {
+        let Some(strategy_ids) = self.strategies_by_market.get(market).cloned() else {
+            return;
+        };
+        let rules = self.market_rules.snapshot();
+
+        for strategy_id in strategy_ids {
+            let Some(strategy) = self.strategies.get(&strategy_id) else {
+                continue;
+            };
+            let [long_market, short_market] = strategy_markets(strategy);
+            let (Some(long_book), Some(short_book)) =
+                (self.books.get(&long_market), self.books.get(&short_market))
+            else {
+                continue;
+            };
+            if !long_book.has_snapshot || !short_book.has_snapshot {
+                continue;
+            }
+            let (Some(long_rule), Some(short_rule)) =
+                (rules.get(&long_market), rules.get(&short_market))
+            else {
+                continue;
+            };
+            let Some(state) = self.strategy_states.get_mut(&strategy_id) else {
+                continue;
+            };
+
+            for command in state.evaluate(
+                &self.shard_id,
+                strategy,
+                long_book,
+                short_book,
+                long_rule,
+                short_rule,
+            ) {
+                if let Err(error) = self.command_tx.try_send(command) {
+                    warn!(
+                        "{} strategy {} failed to enqueue trade command: {}",
+                        self.shard_id, strategy_id, error
+                    );
+                }
             }
         }
     }

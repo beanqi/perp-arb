@@ -136,6 +136,14 @@ impl LocalBookState {
         self.asks_desc.last()
     }
 
+    pub fn bids_desc(&self) -> &[PriceLevel] {
+        &self.bids_desc
+    }
+
+    pub fn asks_desc(&self) -> &[PriceLevel] {
+        &self.asks_desc
+    }
+
     pub fn level_counts(&self) -> (usize, usize) {
         (self.bids_desc.len(), self.asks_desc.len())
     }
