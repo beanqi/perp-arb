@@ -7,7 +7,6 @@ use crate::{
         book::{LocalBookState, PriceLevel},
         types::{Side, TradeCommand},
     },
-    market_rules::MarketRule,
 };
 
 use super::telemetry::StrategyRuntimeMetrics;
@@ -32,6 +31,22 @@ pub enum StrategyAction {
     Close,
 }
 
+impl StrategyAction {
+    pub fn long_side(self) -> Side {
+        match self {
+            StrategyAction::Open => Side::Buy,
+            StrategyAction::Close => Side::Sell,
+        }
+    }
+
+    pub fn short_side(self) -> Side {
+        match self {
+            StrategyAction::Open => Side::Sell,
+            StrategyAction::Close => Side::Buy,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct StrategyOrderPlan {
     pub action: StrategyAction,
@@ -45,7 +60,6 @@ pub struct StrategyOrderPlan {
 
 #[derive(Clone, Debug)]
 pub struct StrategyEvaluation {
-    pub commands: Vec<TradeCommand>,
     pub planned_order: Option<StrategyOrderPlan>,
     pub metrics: StrategyRuntimeMetrics,
 }
@@ -60,30 +74,25 @@ impl StrategyRuntimeState {
 
     pub fn evaluate(
         &mut self,
-        shard_id: &ShardId,
         strategy: &StrategyRecord,
         long_book: &LocalBookState,
         short_book: &LocalBookState,
-        long_rule: &MarketRule,
-        short_rule: &MarketRule,
     ) -> StrategyEvaluation {
         if self.active_order_count + 2 > strategy.max_open_orders {
-            return self.evaluation(Vec::new(), None);
+            return self.evaluation(None);
         }
 
-        let close_plan = self.close_plan(strategy, long_book, short_book, long_rule, short_rule);
+        let close_plan = self.close_plan(strategy, long_book, short_book);
         if let Some(plan) = close_plan {
-            let commands = self.commands_for_plan(shard_id, strategy, &plan);
-            return self.evaluation(commands, Some(plan));
+            return self.evaluation(Some(plan));
         }
 
-        let open_plan = self.open_plan(strategy, long_book, short_book, long_rule, short_rule);
+        let open_plan = self.open_plan(strategy, long_book, short_book);
         if let Some(plan) = open_plan {
-            let commands = self.commands_for_plan(shard_id, strategy, &plan);
-            return self.evaluation(commands, Some(plan));
+            return self.evaluation(Some(plan));
         }
 
-        self.evaluation(Vec::new(), None)
+        self.evaluation(None)
     }
 
     pub fn metrics(&self) -> StrategyRuntimeMetrics {
@@ -97,13 +106,8 @@ impl StrategyRuntimeState {
         }
     }
 
-    fn evaluation(
-        &self,
-        commands: Vec<TradeCommand>,
-        planned_order: Option<StrategyOrderPlan>,
-    ) -> StrategyEvaluation {
+    fn evaluation(&self, planned_order: Option<StrategyOrderPlan>) -> StrategyEvaluation {
         StrategyEvaluation {
-            commands,
             planned_order,
             metrics: self.metrics(),
         }
@@ -114,35 +118,27 @@ impl StrategyRuntimeState {
         strategy: &StrategyRecord,
         long_book: &LocalBookState,
         short_book: &LocalBookState,
-        long_rule: &MarketRule,
-        short_rule: &MarketRule,
     ) -> Option<StrategyOrderPlan> {
         let ask_long = long_book.best_ask()?;
         let bid_short = short_book.best_bid()?;
         let spread_pct = spread_pct(bid_short.price, ask_long.price)?;
         self.last_open_spread_pct = Some(spread_pct);
 
-        let target = target_notional(&strategy.open_levels, spread_pct).min(strategy.max_total_notional);
+        let target =
+            target_notional(&strategy.open_levels, spread_pct).min(strategy.max_total_notional);
         let current_or_pending = self.current_pair_notional + self.pending_open_notional;
         let desired = positive_delta(target, current_or_pending)?;
         let room = positive_delta(strategy.max_total_notional, current_or_pending)?;
         let desired = desired.min(room);
 
         let matched = match_open_depth(long_book, short_book, desired)?;
-        let normalized = normalize_pair_notional(
-            matched.notional_usd,
-            matched.long_price,
-            matched.short_price,
-            long_rule,
-            short_rule,
-        )?;
 
         Some(StrategyOrderPlan {
             action: StrategyAction::Open,
             spread_pct,
-            notional_usd: normalized.notional_usd,
-            long_qty: normalized.long_qty,
-            short_qty: normalized.short_qty,
+            notional_usd: matched.notional_usd,
+            long_qty: matched.long_qty,
+            short_qty: matched.short_qty,
             long_limit_price: matched.long_price,
             short_limit_price: matched.short_price,
         })
@@ -153,8 +149,6 @@ impl StrategyRuntimeState {
         strategy: &StrategyRecord,
         long_book: &LocalBookState,
         short_book: &LocalBookState,
-        long_rule: &MarketRule,
-        short_rule: &MarketRule,
     ) -> Option<StrategyOrderPlan> {
         let bid_long = long_book.best_bid()?;
         let ask_short = short_book.best_ask()?;
@@ -169,26 +163,19 @@ impl StrategyRuntimeState {
         }
 
         let matched = match_close_depth(long_book, short_book, desired)?;
-        let normalized = normalize_pair_notional(
-            matched.notional_usd,
-            matched.long_price,
-            matched.short_price,
-            long_rule,
-            short_rule,
-        )?;
 
         Some(StrategyOrderPlan {
             action: StrategyAction::Close,
             spread_pct,
-            notional_usd: normalized.notional_usd,
-            long_qty: normalized.long_qty,
-            short_qty: normalized.short_qty,
+            notional_usd: matched.notional_usd,
+            long_qty: matched.long_qty,
+            short_qty: matched.short_qty,
             long_limit_price: matched.long_price,
             short_limit_price: matched.short_price,
         })
     }
 
-    fn commands_for_plan(
+    pub fn commit_plan(
         &mut self,
         shard_id: &ShardId,
         strategy: &StrategyRecord,
@@ -200,15 +187,6 @@ impl StrategyRuntimeState {
             StrategyAction::Close => self.pending_close_notional += plan.notional_usd,
         }
 
-        let long_side = match plan.action {
-            StrategyAction::Open => Side::Buy,
-            StrategyAction::Close => Side::Sell,
-        };
-        let short_side = match plan.action {
-            StrategyAction::Open => Side::Sell,
-            StrategyAction::Close => Side::Buy,
-        };
-
         vec![
             TradeCommand::PlaceOrder {
                 shard_id: shard_id.clone(),
@@ -216,7 +194,7 @@ impl StrategyRuntimeState {
                 account_id: strategy.long_leg.account_id.clone(),
                 exchange: strategy.long_leg.exchange,
                 symbol: strategy.long_leg.symbol.clone(),
-                side: long_side,
+                side: plan.action.long_side(),
                 qty: plan.long_qty,
                 limit_price: Some(plan.long_limit_price),
                 client_order_id: self.next_client_order_id(shard_id, &strategy.id, "long"),
@@ -227,7 +205,7 @@ impl StrategyRuntimeState {
                 account_id: strategy.short_leg.account_id.clone(),
                 exchange: strategy.short_leg.exchange,
                 symbol: strategy.short_leg.symbol.clone(),
-                side: short_side,
+                side: plan.action.short_side(),
                 qty: plan.short_qty,
                 limit_price: Some(plan.short_limit_price),
                 client_order_id: self.next_client_order_id(shard_id, &strategy.id, "short"),
@@ -255,15 +233,10 @@ impl StrategyRuntimeState {
 #[derive(Clone, Copy, Debug)]
 struct DepthMatch {
     notional_usd: f64,
-    long_price: f64,
-    short_price: f64,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct NormalizedPair {
-    notional_usd: f64,
     long_qty: f64,
     short_qty: f64,
+    long_price: f64,
+    short_price: f64,
 }
 
 pub fn target_notional(levels: &[SpreadLevel], spread_pct: f64) -> f64 {
@@ -277,7 +250,10 @@ pub fn target_notional(levels: &[SpreadLevel], spread_pct: f64) -> f64 {
 pub fn strategy_markets(strategy: &StrategyRecord) -> [MarketKey; 2] {
     [
         MarketKey::new(strategy.long_leg.exchange, strategy.long_leg.symbol.clone()),
-        MarketKey::new(strategy.short_leg.exchange, strategy.short_leg.symbol.clone()),
+        MarketKey::new(
+            strategy.short_leg.exchange,
+            strategy.short_leg.symbol.clone(),
+        ),
     ]
 }
 
@@ -288,7 +264,7 @@ fn match_open_depth(
 ) -> Option<DepthMatch> {
     match_depth(
         long_book.asks_desc().iter().rev(),
-        short_book.bids_desc().iter(),
+        short_book.bids_asc().iter().rev(),
         desired_notional,
     )
 }
@@ -299,7 +275,7 @@ fn match_close_depth(
     desired_notional: f64,
 ) -> Option<DepthMatch> {
     match_depth(
-        long_book.bids_desc().iter(),
+        long_book.bids_asc().iter().rev(),
         short_book.asks_desc().iter().rev(),
         desired_notional,
     )
@@ -310,13 +286,15 @@ fn match_depth<'a>(
     short_levels: impl Iterator<Item = &'a PriceLevel>,
     desired_notional: f64,
 ) -> Option<DepthMatch> {
-    if desired_notional <= 0.0 {
+    if !desired_notional.is_finite() || desired_notional <= 0.0 {
         return None;
     }
 
     // 两腿撮合只扫固定前10档，避免热路径分配和无界循环。
     let mut remaining = desired_notional;
     let mut matched = 0.0;
+    let mut long_qty = 0.0;
+    let mut short_qty = 0.0;
     let mut last_long_price = None;
     let mut last_short_price = None;
     let mut long_iter = long_levels.take(MAX_MATCH_LEVELS);
@@ -329,6 +307,8 @@ fn match_depth<'a>(
     while remaining > 0.0 {
         let take = remaining.min(long_remaining).min(short_remaining);
         matched += take;
+        long_qty += take / long_level.price;
+        short_qty += take / short_level.price;
         remaining -= take;
         last_long_price = Some(long_level.price);
         last_short_price = Some(short_level.price);
@@ -354,10 +334,14 @@ fn match_depth<'a>(
 
     Some(DepthMatch {
         notional_usd: matched,
+        long_qty,
+        short_qty,
         long_price: last_long_price?,
         short_price: last_short_price?,
     })
-    .filter(|matched| matched.notional_usd > 0.0)
+    .filter(|matched| {
+        matched.notional_usd > 0.0 && matched.long_qty > 0.0 && matched.short_qty > 0.0
+    })
 }
 
 fn next_positive_level<'a>(
@@ -371,65 +355,6 @@ fn level_notional(level: &PriceLevel) -> f64 {
         return 0.0;
     }
     level.price * level.qty
-}
-
-fn normalize_pair_notional(
-    notional_usd: f64,
-    long_price: f64,
-    short_price: f64,
-    long_rule: &MarketRule,
-    short_rule: &MarketRule,
-) -> Option<NormalizedPair> {
-    let long_qty = normalize_qty(notional_usd / long_price, long_rule)?;
-    let short_qty = normalize_qty(notional_usd / short_price, short_rule)?;
-    let normalized_notional = (long_qty * long_price).min(short_qty * short_price);
-
-    if !passes_minimums(long_qty, long_price, long_rule)
-        || !passes_minimums(short_qty, short_price, short_rule)
-        || normalized_notional <= 0.0
-    {
-        return None;
-    }
-
-    Some(NormalizedPair {
-        notional_usd: normalized_notional,
-        long_qty,
-        short_qty,
-    })
-}
-
-fn normalize_qty(qty: f64, rule: &MarketRule) -> Option<f64> {
-    if !qty.is_finite() || qty <= 0.0 {
-        return None;
-    }
-
-    let stepped = if let Some(step) = rule.qty_step.filter(|step| *step > 0.0) {
-        (qty / step).floor() * step
-    } else if let Some(precision) = rule.qty_precision {
-        floor_to_precision(qty, precision)
-    } else {
-        qty
-    };
-
-    Some(stepped).filter(|qty| qty.is_finite() && *qty > 0.0)
-}
-
-fn passes_minimums(qty: f64, price: f64, rule: &MarketRule) -> bool {
-    if rule.min_qty.is_some_and(|min_qty| qty < min_qty) {
-        return false;
-    }
-    if rule
-        .min_notional
-        .is_some_and(|min_notional| qty * price < min_notional)
-    {
-        return false;
-    }
-    true
-}
-
-fn floor_to_precision(value: f64, precision: u32) -> f64 {
-    let scale = 10_f64.powi(precision as i32);
-    (value * scale).floor() / scale
 }
 
 fn spread_pct(exit_price: f64, entry_price: f64) -> Option<f64> {
