@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "revision": 13,
+  "revision": 15,
   "strategies": [
     {
       "id": "btc-binance-bybit",
@@ -36,7 +36,7 @@
       "max_open_orders": 4,
       "stale_order_query_ms": 3000,
       "created_at_ms": 1777017063506,
-      "updated_at_ms": 1777278335289
+      "updated_at_ms": 1777284744099
     }
   ],
   "accounts": [

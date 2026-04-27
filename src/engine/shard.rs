@@ -15,13 +15,16 @@ use crate::{
         planner::{RuntimePlan, ShardPlan, build_runtime_plan},
     },
     error::{AppError, AppResult},
-    gateway::market_ws::{MarketWsHandle, MarketWsRuntime},
+    gateway::{
+        market_ws::{MarketWsHandle, MarketWsRuntime},
+        trade_exec::{PlaceOrderReject, PreparedPlaceOrder, prepare_place_order},
+    },
     market_rules::MarketRuleStore,
 };
 
 use super::{
     book::{BookApplyResult, LocalBookState, decode_raw_depth},
-    strategy::{StrategyAction, StrategyRuntimeState, strategy_markets},
+    strategy::{StrategyAction, StrategyOrderPlan, StrategyRuntimeState, strategy_markets},
     telemetry::{
         StrategyMatchEvent, StrategyMatchEventKind, StrategyRuntimeDescriptor, StrategyRuntimeSnapshot,
         StrategyTelemetryEvent, StrategyTelemetryHub,
@@ -470,7 +473,6 @@ impl ShardRunner {
         let Some(strategy_ids) = self.strategies_by_market.get(market).cloned() else {
             return;
         };
-        let rules = self.market_rules.snapshot();
 
         for strategy_id in strategy_ids {
             let Some(strategy) = self.strategies.get(&strategy_id) else {
@@ -485,21 +487,9 @@ impl ShardRunner {
             if !long_book.has_snapshot || !short_book.has_snapshot {
                 continue;
             }
-            let (Some(long_rule), Some(short_rule)) =
-                (rules.get(&long_market), rules.get(&short_market))
-            else {
-                continue;
-            };
             let Some((evaluation, open_spread_pct, close_spread_pct)) =
                 self.strategy_states.get_mut(&strategy_id).map(|state| {
-                    let evaluation = state.evaluate(
-                        &self.shard_id,
-                        strategy,
-                        long_book,
-                        short_book,
-                        long_rule,
-                        short_rule,
-                    );
+                    let evaluation = state.evaluate(strategy, long_book, short_book);
                     (
                         evaluation,
                         state.last_open_spread_pct,
@@ -509,16 +499,34 @@ impl ShardRunner {
             else {
                 continue;
             };
+            let mut metrics = evaluation.metrics;
+            let mut planned_order = None;
+            let mut commands = Vec::new();
+
+            if let Some(plan) = evaluation.planned_order
+                && let Some(prepared_plan) = self.prepare_plan_for_order(strategy, &plan)
+            {
+                commands = self
+                    .strategy_states
+                    .get_mut(&strategy_id)
+                    .map(|state| state.commit_plan(&self.shard_id, strategy, &prepared_plan))
+                    .unwrap_or_default();
+                if let Some(state) = self.strategy_states.get(&strategy_id) {
+                    metrics = state.metrics();
+                }
+                planned_order = Some(prepared_plan);
+            }
+
             let ts_ms = now_ms();
             self.send_telemetry(StrategyTelemetryEvent::MetricsUpdated {
                 generation: self.telemetry_generation,
                 shard_id: self.shard_id.clone(),
                 strategy_id: strategy_id.clone(),
-                metrics: evaluation.metrics,
+                metrics,
                 ts_ms,
             });
 
-            if let Some(plan) = evaluation.planned_order {
+            if let Some(plan) = planned_order {
                 let kind = match plan.action {
                     StrategyAction::Open => StrategyMatchEventKind::OpenPlanned,
                     StrategyAction::Close => StrategyMatchEventKind::ClosePlanned,
@@ -541,7 +549,7 @@ impl ShardRunner {
                 });
             }
 
-            for command in evaluation.commands {
+            for command in commands {
                 if let Err(error) = self.command_tx.try_send(command) {
                     warn!(
                         "{} strategy {} failed to enqueue trade command: {}",
@@ -552,11 +560,90 @@ impl ShardRunner {
         }
     }
 
+    fn prepare_plan_for_order(
+        &self,
+        strategy: &StrategyRecord,
+        plan: &StrategyOrderPlan,
+    ) -> Option<StrategyOrderPlan> {
+        // market rule 只在下单边界应用，撮合阶段保持纯深度计算。
+        let [long_market, short_market] = strategy_markets(strategy);
+        let rules = self.market_rules.snapshot();
+        let Some(long_rule) = rules.get(&long_market) else {
+            warn!(
+                "{} strategy {} skip order: missing market rule for {}",
+                self.shard_id, strategy.id, long_market
+            );
+            return None;
+        };
+        let Some(short_rule) = rules.get(&short_market) else {
+            warn!(
+                "{} strategy {} skip order: missing market rule for {}",
+                self.shard_id, strategy.id, short_market
+            );
+            return None;
+        };
+
+        let long_order = match prepare_place_order(
+            plan.long_qty,
+            Some(plan.long_limit_price),
+            &plan.action.long_side(),
+            long_rule,
+        ) {
+            Ok(order) => order,
+            Err(reason) => {
+                self.warn_order_reject(strategy, &long_market, reason);
+                return None;
+            }
+        };
+        let short_order = match prepare_place_order(
+            plan.short_qty,
+            Some(plan.short_limit_price),
+            &plan.action.short_side(),
+            short_rule,
+        ) {
+            Ok(order) => order,
+            Err(reason) => {
+                self.warn_order_reject(strategy, &short_market, reason);
+                return None;
+            }
+        };
+
+        let notional_usd = order_notional(long_order).min(order_notional(short_order));
+        (notional_usd > 0.0).then(|| StrategyOrderPlan {
+            action: plan.action,
+            spread_pct: plan.spread_pct,
+            notional_usd,
+            long_qty: long_order.qty,
+            short_qty: short_order.qty,
+            long_limit_price: long_order.limit_price.unwrap_or(plan.long_limit_price),
+            short_limit_price: short_order.limit_price.unwrap_or(plan.short_limit_price),
+        })
+    }
+
+    fn warn_order_reject(
+        &self,
+        strategy: &StrategyRecord,
+        market: &MarketKey,
+        reason: PlaceOrderReject,
+    ) {
+        warn!(
+            "{} strategy {} skip order market={} rule reject: {}",
+            self.shard_id,
+            strategy.id,
+            market,
+            reason
+        );
+    }
+
     fn send_telemetry(&self, event: StrategyTelemetryEvent) {
         if let Err(error) = self.telemetry_tx.try_send(event) {
             warn!("{} strategy telemetry event dropped: {}", self.shard_id, error);
         }
     }
+}
+
+fn order_notional(order: PreparedPlaceOrder) -> f64 {
+    order.notional_usd.unwrap_or(0.0)
 }
 
 fn strategy_descriptor(strategy: &StrategyRecord) -> StrategyRuntimeDescriptor {
