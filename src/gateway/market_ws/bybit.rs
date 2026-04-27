@@ -12,8 +12,8 @@ use tracing::{info, warn};
 
 use crate::{
     engine::{
-        book::{RawDepthMessage, decode_raw_depth},
-        types::ShardEvent,
+        book::{RawDepthMessage, decode_raw_depth_with_timing},
+        types::{DepthEventTiming, ShardEvent},
     },
     gateway::market_ws::MarketWsRuntime,
 };
@@ -134,9 +134,11 @@ impl BybitDepthSynchronizer {
         received_at: Instant,
         shard_tx: &Sender<ShardEvent>,
     ) -> Result<(), String> {
-        let Some(message) = decode_raw_depth(self.runtime.exchange, payload) else {
+        let Some(decoded) = decode_raw_depth_with_timing(self.runtime.exchange, payload) else {
             return Ok(());
         };
+        let mut timing = DepthEventTiming::new(payload.len(), decoded.timing);
+        let message = decoded.message;
         if !self.seen_first_payload {
             info!(
                 "market ws {} bybit first depth payload received",
@@ -154,11 +156,13 @@ impl BybitDepthSynchronizer {
             return Ok(());
         }
 
+        timing.mark_enqueued();
         shard_tx
             .try_send(ShardEvent::MarketWsRaw {
                 connection_id: self.runtime.connection_id.clone(),
                 message,
                 received_at,
+                timing,
             })
             .map_err(|error| format!("shard queue send failed: {error}"))
     }

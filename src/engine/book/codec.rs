@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, time::Instant};
 
 use serde::{
     Deserialize, Deserializer,
@@ -7,43 +7,64 @@ use serde::{
 
 use crate::config::model::{Exchange, MarketKey};
 
-use super::{PriceLevel, RawDepthMessage};
+use super::{DecodedDepthMessage, DepthDecodeTiming, PriceLevel, RawDepthMessage};
 
 pub fn decode_raw_depth(exchange: Exchange, payload: &[u8]) -> Option<RawDepthMessage> {
+    decode_raw_depth_with_timing(exchange, payload).map(|decoded| decoded.message)
+}
+
+pub fn decode_raw_depth_with_timing(
+    exchange: Exchange,
+    payload: &[u8],
+) -> Option<DecodedDepthMessage> {
     match exchange {
         Exchange::BinanceUsdM => decode_binance_depth(payload),
         Exchange::BybitLinear => decode_bybit_depth(payload),
     }
 }
 
-fn decode_binance_depth(payload: &[u8]) -> Option<RawDepthMessage> {
+fn decode_binance_depth(payload: &[u8]) -> Option<DecodedDepthMessage> {
+    let deserialize_started_at = Instant::now();
     let envelope = sonic_rs::from_slice::<BinanceDepthEnvelope<'_>>(payload).ok()?;
+    let deserialize_us = deserialize_started_at.elapsed().as_micros();
+    let normalize_started_at = Instant::now();
     let data = match envelope {
         BinanceDepthEnvelope::Combined { data } | BinanceDepthEnvelope::Direct(data) => data,
     };
     let market = MarketKey::new(Exchange::BinanceUsdM, data.symbol);
 
-    if data.event == Some(BinanceDepthEvent::DepthUpdate) {
-        return Some(RawDepthMessage::Delta {
+    let message = if data.event == Some(BinanceDepthEvent::DepthUpdate) {
+        RawDepthMessage::Delta {
             market,
             first_sequence: data.first_sequence,
             previous_sequence: data.previous_sequence,
             sequence: data.sequence,
             bids: parse_levels(data.delta_bids?),
             asks: parse_levels(data.delta_asks?),
-        });
-    }
+        }
+    } else {
+        RawDepthMessage::Snapshot {
+            market,
+            sequence: data.last_update_id,
+            bids: parse_levels(data.snapshot_bids?),
+            asks: parse_levels(data.snapshot_asks?),
+        }
+    };
 
-    Some(RawDepthMessage::Snapshot {
-        market,
-        sequence: data.last_update_id,
-        bids: parse_levels(data.snapshot_bids?),
-        asks: parse_levels(data.snapshot_asks?),
+    Some(DecodedDepthMessage {
+        message,
+        timing: DepthDecodeTiming {
+            deserialize_us,
+            normalize_us: normalize_started_at.elapsed().as_micros(),
+        },
     })
 }
 
-fn decode_bybit_depth(payload: &[u8]) -> Option<RawDepthMessage> {
+fn decode_bybit_depth(payload: &[u8]) -> Option<DecodedDepthMessage> {
+    let deserialize_started_at = Instant::now();
     let envelope = sonic_rs::from_slice::<BybitDepthEnvelope<'_>>(payload).ok()?;
+    let deserialize_us = deserialize_started_at.elapsed().as_micros();
+    let normalize_started_at = Instant::now();
     let symbol = envelope
         .data
         .symbol
@@ -53,23 +74,31 @@ fn decode_bybit_depth(payload: &[u8]) -> Option<RawDepthMessage> {
     let bids = parse_levels(envelope.data.bids?);
     let asks = parse_levels(envelope.data.asks?);
 
-    if envelope.message_type == Some(BybitMessageType::Delta) {
-        Some(RawDepthMessage::Delta {
+    let message = if envelope.message_type == Some(BybitMessageType::Delta) {
+        RawDepthMessage::Delta {
             market,
             first_sequence: sequence,
             previous_sequence: None,
             sequence,
             bids,
             asks,
-        })
+        }
     } else {
-        Some(RawDepthMessage::Snapshot {
+        RawDepthMessage::Snapshot {
             market,
             sequence,
             bids,
             asks,
-        })
-    }
+        }
+    };
+
+    Some(DecodedDepthMessage {
+        message,
+        timing: DepthDecodeTiming {
+            deserialize_us,
+            normalize_us: normalize_started_at.elapsed().as_micros(),
+        },
+    })
 }
 
 #[derive(Debug, Deserialize)]

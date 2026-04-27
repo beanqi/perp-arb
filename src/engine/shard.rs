@@ -443,13 +443,19 @@ impl ShardRunner {
             ShardEvent::MarketWsRaw {
                 message,
                 received_at,
+                timing,
                 ..
             } => {
                 let market = message.market().clone();
+                let depth_kind = message.kind();
+                let (bid_updates, ask_updates) = message.level_counts();
+                let queue_wait_us = timing.queue_wait_us();
                 if let Some(&book_idx) = self.book_by_market.get(&market)
                     && let Some(book) = self.books.get_mut(book_idx)
                 {
-                    let result = book.apply(message);
+                    let apply_result = book.apply_timed(message);
+                    let result = apply_result.result;
+                    let apply_timing = apply_result.timing;
                     let depth_receive_elapsed = received_at.elapsed();
                     // let (bid_depth, ask_depth) = book.level_counts();
                     // info!(
@@ -472,10 +478,25 @@ impl ShardRunner {
                         let commands = self.evaluate_market(&market);
                         let match_elapsed = match_started_at.elapsed();
                         info!(
-                            "{} market {} perf depth_receive_us={} match_us={} order_command_count={}",
+                            "{} market {} perf depth_kind={} result={:?} payload_bytes={} bid_updates={} ask_updates={} depth_receive_us={} deserialize_us={} normalize_us={} gateway_sync_us={} queue_wait_us={} book_apply_us={} book_validate_us={} snapshot_sort_bids_us={} snapshot_sort_asks_us={} merge_bids_us={} merge_asks_us={} match_us={} order_command_count={}",
                             self.shard_id,
                             market,
+                            depth_kind,
+                            result,
+                            timing.payload_bytes,
+                            bid_updates,
+                            ask_updates,
                             depth_receive_elapsed.as_micros(),
+                            timing.decode.deserialize_us,
+                            timing.decode.normalize_us,
+                            timing.gateway_sync_us,
+                            queue_wait_us,
+                            apply_timing.total_us,
+                            apply_timing.validation_us,
+                            apply_timing.sort_bids_us,
+                            apply_timing.sort_asks_us,
+                            apply_timing.merge_bids_us,
+                            apply_timing.merge_asks_us,
                             match_elapsed.as_micros(),
                             commands.len()
                         );

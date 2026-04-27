@@ -8,8 +8,8 @@ use tracing::{info, warn};
 use crate::{
     config::model::{Exchange, MarketKey},
     engine::{
-        book::{PriceLevel, RawDepthMessage, decode_raw_depth},
-        types::ShardEvent,
+        book::{DepthDecodeTiming, PriceLevel, RawDepthMessage, decode_raw_depth_with_timing},
+        types::{DepthEventTiming, ShardEvent},
     },
     gateway::market_ws::MarketWsRuntime,
 };
@@ -45,9 +45,11 @@ impl DepthSynchronizer {
         received_at: Instant,
         shard_tx: &Sender<ShardEvent>,
     ) -> Result<(), String> {
-        let Some(message) = decode_raw_depth(self.runtime.exchange, payload) else {
+        let Some(decoded) = decode_raw_depth_with_timing(self.runtime.exchange, payload) else {
             return Ok(());
         };
+        let timing = DepthEventTiming::new(payload.len(), decoded.timing);
+        let message = decoded.message;
         if !self.seen_first_payload {
             info!(
                 "market ws {} binance first depth payload received",
@@ -62,6 +64,7 @@ impl DepthSynchronizer {
         state.buffer(TimedDepthMessage {
             message,
             received_at,
+            timing,
         });
 
         if !state.ready {
@@ -80,7 +83,13 @@ impl DepthSynchronizer {
         }
 
         while let Some(message) = state.pop_ready_delta() {
-            send_depth_message(&self.runtime, shard_tx, message.message, message.received_at)?;
+            send_depth_message(
+                &self.runtime,
+                shard_tx,
+                message.message,
+                message.received_at,
+                message.timing,
+            )?;
         }
         Ok(())
     }
@@ -144,6 +153,25 @@ impl DepthSynchronizer {
             .snapshot
             .take()
             .ok_or_else(|| format!("missing snapshot for {symbol}"))?;
+        let normalize_started_at = Instant::now();
+        let bids = snapshot
+            .bids
+            .into_iter()
+            .filter_map(parse_snapshot_level)
+            .collect();
+        let asks = snapshot
+            .asks
+            .into_iter()
+            .filter_map(parse_snapshot_level)
+            .collect();
+        let timing = DepthEventTiming::from_gateway_started_at(
+            0,
+            DepthDecodeTiming {
+                deserialize_us: 0,
+                normalize_us: normalize_started_at.elapsed().as_micros(),
+            },
+            snapshot_received_at,
+        );
 
         send_depth_message(
             &self.runtime,
@@ -151,14 +179,21 @@ impl DepthSynchronizer {
             RawDepthMessage::Snapshot {
                 market: MarketKey::new(Exchange::BinanceUsdM, symbol.to_owned()),
                 sequence: Some(last_update_id),
-                bids: snapshot.bids.into_iter().filter_map(parse_snapshot_level).collect(),
-                asks: snapshot.asks.into_iter().filter_map(parse_snapshot_level).collect(),
+                bids,
+                asks,
             },
             snapshot_received_at,
+            timing,
         )?;
 
         for delta in state.mark_ready_and_drain_from(first_delta_index) {
-            send_depth_message(&self.runtime, shard_tx, delta.message, delta.received_at)?;
+            send_depth_message(
+                &self.runtime,
+                shard_tx,
+                delta.message,
+                delta.received_at,
+                delta.timing,
+            )?;
         }
         info!(
             "market ws {} binance symbol={} depth synchronized last_update_id={}",
@@ -186,6 +221,7 @@ struct SymbolSyncState {
 struct TimedDepthMessage {
     message: RawDepthMessage,
     received_at: Instant,
+    timing: DepthEventTiming,
 }
 
 impl SymbolSyncState {
@@ -285,12 +321,15 @@ fn send_depth_message(
     shard_tx: &Sender<ShardEvent>,
     message: RawDepthMessage,
     received_at: Instant,
+    mut timing: DepthEventTiming,
 ) -> Result<(), String> {
+    timing.mark_enqueued();
     shard_tx
         .try_send(ShardEvent::MarketWsRaw {
             connection_id: runtime.connection_id.clone(),
             message,
             received_at,
+            timing,
         })
         .map_err(|error| format!("shard queue send failed: {error}"))
 }

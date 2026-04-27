@@ -1,12 +1,12 @@
 mod codec;
 
-use std::cmp::Ordering;
+use std::{cmp::Ordering, time::Instant};
 
 use serde::{Deserialize, Serialize};
 
 use crate::config::model::{DepthMode, MarketKey};
 
-pub use codec::decode_raw_depth;
+pub use codec::{decode_raw_depth, decode_raw_depth_with_timing};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PriceLevel {
@@ -51,10 +51,53 @@ pub enum BookApplyResult {
     GapDetected,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DepthDecodeTiming {
+    pub deserialize_us: u128,
+    pub normalize_us: u128,
+}
+
+#[derive(Clone, Debug)]
+pub struct DecodedDepthMessage {
+    pub message: RawDepthMessage,
+    pub timing: DepthDecodeTiming,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BookApplyTiming {
+    pub total_us: u128,
+    pub validation_us: u128,
+    pub sort_bids_us: u128,
+    pub sort_asks_us: u128,
+    pub merge_bids_us: u128,
+    pub merge_asks_us: u128,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TimedBookApplyResult {
+    pub result: BookApplyResult,
+    pub timing: BookApplyTiming,
+}
+
 impl RawDepthMessage {
     pub fn market(&self) -> &MarketKey {
         match self {
             Self::Snapshot { market, .. } | Self::Delta { market, .. } => market,
+        }
+    }
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Snapshot { .. } => "snapshot",
+            Self::Delta { .. } => "delta",
+        }
+    }
+
+    pub fn level_counts(&self) -> (usize, usize) {
+        match self {
+            Self::Snapshot { bids, asks, .. } | Self::Delta { bids, asks, .. } => {
+                (bids.len(), asks.len())
+            }
         }
     }
 }
@@ -72,6 +115,12 @@ impl LocalBookState {
     }
 
     pub fn apply(&mut self, message: RawDepthMessage) -> BookApplyResult {
+        self.apply_timed(message).result
+    }
+
+    pub fn apply_timed(&mut self, message: RawDepthMessage) -> TimedBookApplyResult {
+        let total_started_at = Instant::now();
+        let mut timing = BookApplyTiming::default();
         match message {
             RawDepthMessage::Snapshot {
                 sequence,
@@ -79,13 +128,21 @@ impl LocalBookState {
                 mut asks,
                 ..
             } => {
+                let sort_bids_started_at = Instant::now();
                 sort_asc(&mut bids);
+                timing.sort_bids_us = sort_bids_started_at.elapsed().as_micros();
+                let sort_asks_started_at = Instant::now();
                 sort_desc(&mut asks);
+                timing.sort_asks_us = sort_asks_started_at.elapsed().as_micros();
                 self.bids_asc = bids;
                 self.asks_desc = asks;
                 self.has_snapshot = true;
                 self.last_sequence = sequence;
-                BookApplyResult::Applied
+                timing.total_us = total_started_at.elapsed().as_micros();
+                TimedBookApplyResult {
+                    result: BookApplyResult::Applied,
+                    timing,
+                }
             }
             RawDepthMessage::Delta {
                 first_sequence,
@@ -95,14 +152,25 @@ impl LocalBookState {
                 asks,
                 ..
             } => {
+                let validation_started_at = Instant::now();
                 if self.mode == DepthMode::SnapshotThenIncremental && !self.has_snapshot {
-                    return BookApplyResult::WaitingForSnapshot;
+                    timing.validation_us = validation_started_at.elapsed().as_micros();
+                    timing.total_us = total_started_at.elapsed().as_micros();
+                    return TimedBookApplyResult {
+                        result: BookApplyResult::WaitingForSnapshot,
+                        timing,
+                    };
                 }
 
                 if let Some(last) = self.last_sequence {
                     if let Some(current) = sequence {
                         if current <= last {
-                            return BookApplyResult::IgnoredStale;
+                            timing.validation_us = validation_started_at.elapsed().as_micros();
+                            timing.total_us = total_started_at.elapsed().as_micros();
+                            return TimedBookApplyResult {
+                                result: BookApplyResult::IgnoredStale,
+                                timing,
+                            };
                         }
                     }
 
@@ -112,21 +180,40 @@ impl LocalBookState {
                             && sequence.is_some_and(|current| current >= last + 1);
                         if previous != last && !bridges_snapshot {
                             self.clear_for_rebuild();
-                            return BookApplyResult::GapDetected;
+                            timing.validation_us = validation_started_at.elapsed().as_micros();
+                            timing.total_us = total_started_at.elapsed().as_micros();
+                            return TimedBookApplyResult {
+                                result: BookApplyResult::GapDetected,
+                                timing,
+                            };
                         }
                     } else if let Some(first) = first_sequence {
                         if first > last + 1 {
                             self.clear_for_rebuild();
-                            return BookApplyResult::GapDetected;
+                            timing.validation_us = validation_started_at.elapsed().as_micros();
+                            timing.total_us = total_started_at.elapsed().as_micros();
+                            return TimedBookApplyResult {
+                                result: BookApplyResult::GapDetected,
+                                timing,
+                            };
                         }
                     }
                 }
+                timing.validation_us = validation_started_at.elapsed().as_micros();
 
+                let merge_bids_started_at = Instant::now();
                 apply_levels(&mut self.bids_asc, bids, compare_price_asc);
+                timing.merge_bids_us = merge_bids_started_at.elapsed().as_micros();
+                let merge_asks_started_at = Instant::now();
                 apply_levels(&mut self.asks_desc, asks, compare_price_desc);
+                timing.merge_asks_us = merge_asks_started_at.elapsed().as_micros();
                 self.has_snapshot = true;
                 self.last_sequence = sequence.or(self.last_sequence);
-                BookApplyResult::Applied
+                timing.total_us = total_started_at.elapsed().as_micros();
+                TimedBookApplyResult {
+                    result: BookApplyResult::Applied,
+                    timing,
+                }
             }
         }
     }
