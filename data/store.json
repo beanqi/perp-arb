@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "revision": 15,
+  "revision": 16,
   "strategies": [
     {
       "id": "btc-binance-bybit",
@@ -37,6 +37,78 @@
       "stale_order_query_ms": 3000,
       "created_at_ms": 1777017063506,
       "updated_at_ms": 1777284744099
+    },
+    {
+      "id": "eth-binance-bybit",
+      "name": "ETH Binance/Bybit",
+      "enabled": true,
+      "long_leg": {
+        "exchange": "binance_usd_m",
+        "symbol": "ETHUSDT",
+        "account_id": "binance-main"
+      },
+      "short_leg": {
+        "exchange": "bybit_linear",
+        "symbol": "ETHUSDT",
+        "account_id": "bybit-main"
+      },
+      "open_levels": [
+        {
+          "spread_pct": 1.0,
+          "notional_usd": 100.0
+        },
+        {
+          "spread_pct": 2.0,
+          "notional_usd": 100.0
+        }
+      ],
+      "close_levels": [
+        {
+          "spread_pct": 0.5,
+          "notional_usd": 100.0
+        }
+      ],
+      "max_total_notional": 500.0,
+      "max_open_orders": 4,
+      "stale_order_query_ms": 3000,
+      "created_at_ms": 1777290206366,
+      "updated_at_ms": 1777290206366
+    },
+    {
+      "id": "sol-binance-bybit",
+      "name": "SOL Binance/Bybit",
+      "enabled": true,
+      "long_leg": {
+        "exchange": "binance_usd_m",
+        "symbol": "SOLUSDT",
+        "account_id": "binance-main"
+      },
+      "short_leg": {
+        "exchange": "bybit_linear",
+        "symbol": "SOLUSDT",
+        "account_id": "bybit-main"
+      },
+      "open_levels": [
+        {
+          "spread_pct": 1.0,
+          "notional_usd": 100.0
+        },
+        {
+          "spread_pct": 2.0,
+          "notional_usd": 100.0
+        }
+      ],
+      "close_levels": [
+        {
+          "spread_pct": 0.5,
+          "notional_usd": 100.0
+        }
+      ],
+      "max_total_notional": 500.0,
+      "max_open_orders": 4,
+      "stale_order_query_ms": 3000,
+      "created_at_ms": 1777290206366,
+      "updated_at_ms": 1777290206366
     }
   ],
   "accounts": [

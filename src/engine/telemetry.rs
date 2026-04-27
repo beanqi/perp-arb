@@ -92,6 +92,13 @@ pub struct StrategyRuntimeMetrics {
 }
 
 #[derive(Clone, Debug)]
+pub struct StrategyRuntimeMetricsUpdate {
+    pub strategy_id: StrategyId,
+    pub metrics: StrategyRuntimeMetrics,
+    pub ts_ms: u64,
+}
+
+#[derive(Clone, Debug)]
 pub enum StrategyTelemetryEvent {
     RuntimeLoaded {
         generation: u64,
@@ -103,6 +110,11 @@ pub enum StrategyTelemetryEvent {
         strategy_id: StrategyId,
         metrics: StrategyRuntimeMetrics,
         ts_ms: u64,
+    },
+    MetricsBatchUpdated {
+        generation: u64,
+        shard_id: ShardId,
+        updates: Vec<StrategyRuntimeMetricsUpdate>,
     },
     OrderPlanned {
         generation: u64,
@@ -226,6 +238,19 @@ fn telemetry_loop(
                         dirty = true;
                     }
                 }
+                Ok(StrategyTelemetryEvent::MetricsBatchUpdated {
+                    generation: event_generation,
+                    shard_id,
+                    updates,
+                }) => {
+                    if event_generation != generation {
+                        continue;
+                    }
+                    let _ = shard_id;
+                    for update in updates {
+                        apply_metrics_update(&mut views, update, &mut dirty);
+                    }
+                }
                 Ok(StrategyTelemetryEvent::OrderPlanned {
                     generation: event_generation,
                     event,
@@ -251,6 +276,23 @@ fn telemetry_loop(
                 }
             },
         }
+    }
+}
+
+fn apply_metrics_update(
+    views: &mut BTreeMap<StrategyId, StrategyRuntimeView>,
+    update: StrategyRuntimeMetricsUpdate,
+    dirty: &mut bool,
+) {
+    if let Some(view) = views.get_mut(&update.strategy_id) {
+        view.open_spread_pct = update.metrics.open_spread_pct;
+        view.close_spread_pct = update.metrics.close_spread_pct;
+        view.current_pair_notional = update.metrics.current_pair_notional;
+        view.pending_open_notional = update.metrics.pending_open_notional;
+        view.pending_close_notional = update.metrics.pending_close_notional;
+        view.active_order_count = update.metrics.active_order_count;
+        view.last_updated_ms = update.ts_ms;
+        *dirty = true;
     }
 }
 

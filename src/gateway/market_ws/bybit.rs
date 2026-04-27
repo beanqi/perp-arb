@@ -2,7 +2,7 @@ use std::{collections::HashMap, time::Duration};
 
 use crossbeam_channel::Sender;
 use futures_util::{SinkExt, StreamExt};
-use serde_json::json;
+use serde::Serialize;
 use tokio::time::MissedTickBehavior;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{info, warn};
@@ -69,7 +69,7 @@ async fn run_once(
     loop {
         tokio::select! {
             _ = keepalive.tick() => {
-                write.send(Message::Text(json!({"op": "ping"}).to_string().into())).await.map_err(|error| format!("ping failed: {error}"))?;
+                write.send(Message::Text(r#"{"op":"ping"}"#.into())).await.map_err(|error| format!("ping failed: {error}"))?;
             }
             message = read.next() => {
                 let message = message.ok_or_else(|| "websocket stream ended".to_owned())?
@@ -91,11 +91,17 @@ fn subscription_message(symbols: &[String]) -> Result<String, String> {
         .iter()
         .map(|symbol| format!("orderbook.{ORDERBOOK_DEPTH}.{symbol}"))
         .collect::<Vec<_>>();
-    serde_json::to_string(&json!({
-        "op": "subscribe",
-        "args": args,
-    }))
+    sonic_rs::to_string(&BybitSubscription {
+        op: "subscribe",
+        args,
+    })
     .map_err(|error| format!("subscribe encode failed: {error}"))
+}
+
+#[derive(Serialize)]
+struct BybitSubscription {
+    op: &'static str,
+    args: Vec<String>,
 }
 
 struct BybitDepthSynchronizer {
@@ -146,8 +152,7 @@ impl BybitDepthSynchronizer {
         shard_tx
             .try_send(ShardEvent::MarketWsRaw {
                 connection_id: self.runtime.connection_id.clone(),
-                exchange: self.runtime.exchange,
-                payload: payload.to_vec(),
+                message,
             })
             .map_err(|error| format!("shard queue send failed: {error}"))
     }

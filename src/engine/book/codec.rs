@@ -1,58 +1,59 @@
-use serde_json::Value;
+use std::fmt;
+
+use serde::{
+    Deserialize, Deserializer,
+    de::{self, Visitor},
+};
 
 use crate::config::model::{Exchange, MarketKey};
 
 use super::{PriceLevel, RawDepthMessage};
 
 pub fn decode_raw_depth(exchange: Exchange, payload: &[u8]) -> Option<RawDepthMessage> {
-    let value = serde_json::from_slice::<Value>(payload).ok()?;
     match exchange {
-        Exchange::BinanceUsdM => decode_binance_depth(&value),
-        Exchange::BybitLinear => decode_bybit_depth(&value),
+        Exchange::BinanceUsdM => decode_binance_depth(payload),
+        Exchange::BybitLinear => decode_bybit_depth(payload),
     }
 }
 
-fn decode_binance_depth(value: &Value) -> Option<RawDepthMessage> {
-    let data = value.get("data").unwrap_or(value);
-    let symbol = data.get("s")?.as_str()?.to_owned();
-    let market = MarketKey::new(Exchange::BinanceUsdM, symbol);
+fn decode_binance_depth(payload: &[u8]) -> Option<RawDepthMessage> {
+    let envelope = sonic_rs::from_slice::<BinanceDepthEnvelope<'_>>(payload).ok()?;
+    let data = match envelope {
+        BinanceDepthEnvelope::Combined { data } | BinanceDepthEnvelope::Direct(data) => data,
+    };
+    let market = MarketKey::new(Exchange::BinanceUsdM, data.symbol);
 
-    if data.get("e").and_then(Value::as_str) == Some("depthUpdate") {
+    if data.event == Some(BinanceDepthEvent::DepthUpdate) {
         return Some(RawDepthMessage::Delta {
             market,
-            first_sequence: data.get("U").and_then(Value::as_u64),
-            previous_sequence: data.get("pu").and_then(Value::as_u64),
-            sequence: data.get("u").and_then(Value::as_u64),
-            bids: parse_levels(data.get("b")?),
-            asks: parse_levels(data.get("a")?),
+            first_sequence: data.first_sequence,
+            previous_sequence: data.previous_sequence,
+            sequence: data.sequence,
+            bids: parse_levels(data.delta_bids?),
+            asks: parse_levels(data.delta_asks?),
         });
     }
 
     Some(RawDepthMessage::Snapshot {
         market,
-        sequence: data.get("lastUpdateId").and_then(Value::as_u64),
-        bids: parse_levels(data.get("bids")?),
-        asks: parse_levels(data.get("asks")?),
+        sequence: data.last_update_id,
+        bids: parse_levels(data.snapshot_bids?),
+        asks: parse_levels(data.snapshot_asks?),
     })
 }
 
-fn decode_bybit_depth(value: &Value) -> Option<RawDepthMessage> {
-    let data = value.get("data")?;
-    let symbol = data
-        .get("s")
-        .and_then(Value::as_str)
-        .or_else(|| symbol_from_topic(value.get("topic").and_then(Value::as_str)))?
-        .to_owned();
+fn decode_bybit_depth(payload: &[u8]) -> Option<RawDepthMessage> {
+    let envelope = sonic_rs::from_slice::<BybitDepthEnvelope<'_>>(payload).ok()?;
+    let symbol = envelope
+        .data
+        .symbol
+        .or_else(|| symbol_from_topic(envelope.topic))?;
     let market = MarketKey::new(Exchange::BybitLinear, symbol);
-    let sequence = data
-        .get("u")
-        .and_then(Value::as_u64)
-        .or_else(|| data.get("seq").and_then(Value::as_u64));
-    let message_type = value.get("type").and_then(Value::as_str);
-    let bids = parse_levels(data.get("b")?);
-    let asks = parse_levels(data.get("a")?);
+    let sequence = envelope.data.sequence.or(envelope.data.seq);
+    let bids = parse_levels(envelope.data.bids?);
+    let asks = parse_levels(envelope.data.asks?);
 
-    if message_type == Some("delta") {
+    if envelope.message_type == Some(BybitMessageType::Delta) {
         Some(RawDepthMessage::Delta {
             market,
             first_sequence: sequence,
@@ -71,29 +72,206 @@ fn decode_bybit_depth(value: &Value) -> Option<RawDepthMessage> {
     }
 }
 
-fn symbol_from_topic(topic: Option<&str>) -> Option<&str> {
-    topic?.rsplit('.').next()
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum BinanceDepthEnvelope<'a> {
+    Combined {
+        #[serde(borrow)]
+        data: BinanceDepthData<'a>,
+    },
+    Direct(#[serde(borrow)] BinanceDepthData<'a>),
 }
 
-fn parse_levels(value: &Value) -> Vec<PriceLevel> {
-    value
-        .as_array()
+#[derive(Debug, Deserialize)]
+struct BinanceDepthData<'a> {
+    #[serde(rename = "e")]
+    event: Option<BinanceDepthEvent>,
+    #[serde(rename = "s")]
+    symbol: &'a str,
+    #[serde(rename = "U")]
+    first_sequence: Option<u64>,
+    #[serde(rename = "pu")]
+    previous_sequence: Option<u64>,
+    #[serde(rename = "u")]
+    sequence: Option<u64>,
+    #[serde(rename = "b")]
+    delta_bids: Option<Vec<[JsonF64; 2]>>,
+    #[serde(rename = "a")]
+    delta_asks: Option<Vec<[JsonF64; 2]>>,
+    #[serde(rename = "lastUpdateId")]
+    last_update_id: Option<u64>,
+    #[serde(rename = "bids")]
+    snapshot_bids: Option<Vec<[JsonF64; 2]>>,
+    #[serde(rename = "asks")]
+    snapshot_asks: Option<Vec<[JsonF64; 2]>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BybitDepthEnvelope<'a> {
+    #[serde(rename = "type")]
+    message_type: Option<BybitMessageType>,
+    topic: Option<&'a str>,
+    #[serde(borrow)]
+    data: BybitDepthData<'a>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BybitDepthData<'a> {
+    #[serde(rename = "s")]
+    symbol: Option<&'a str>,
+    #[serde(rename = "u")]
+    sequence: Option<u64>,
+    seq: Option<u64>,
+    #[serde(rename = "b")]
+    bids: Option<Vec<[JsonF64; 2]>>,
+    #[serde(rename = "a")]
+    asks: Option<Vec<[JsonF64; 2]>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BinanceDepthEvent {
+    DepthUpdate,
+    Other,
+}
+
+impl<'de> Deserialize<'de> for BinanceDepthEvent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_str(BinanceDepthEventVisitor)
+    }
+}
+
+struct BinanceDepthEventVisitor;
+
+impl Visitor<'_> for BinanceDepthEventVisitor {
+    type Value = BinanceDepthEvent;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a Binance event type")
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(if value == "depthUpdate" {
+            BinanceDepthEvent::DepthUpdate
+        } else {
+            BinanceDepthEvent::Other
+        })
+    }
+
+    fn visit_borrowed_str<E>(self, value: &'_ str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.visit_str(value)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BybitMessageType {
+    Delta,
+    Other,
+}
+
+impl<'de> Deserialize<'de> for BybitMessageType {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_str(BybitMessageTypeVisitor)
+    }
+}
+
+struct BybitMessageTypeVisitor;
+
+impl Visitor<'_> for BybitMessageTypeVisitor {
+    type Value = BybitMessageType;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a Bybit message type")
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        Ok(if value == "delta" {
+            BybitMessageType::Delta
+        } else {
+            BybitMessageType::Other
+        })
+    }
+
+    fn visit_borrowed_str<E>(self, value: &'_ str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.visit_str(value)
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct JsonF64(f64);
+
+impl<'de> Deserialize<'de> for JsonF64 {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        deserializer.deserialize_any(JsonF64Visitor)
+    }
+}
+
+struct JsonF64Visitor;
+
+impl Visitor<'_> for JsonF64Visitor {
+    type Value = JsonF64;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("a JSON number or numeric string")
+    }
+
+    fn visit_f64<E>(self, value: f64) -> Result<Self::Value, E> {
+        Ok(JsonF64(value))
+    }
+
+    fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(JsonF64(value as f64))
+    }
+
+    fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(JsonF64(value as f64))
+    }
+
+    fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        value.parse::<f64>().map(JsonF64).map_err(E::custom)
+    }
+
+    fn visit_borrowed_str<E>(self, value: &'_ str) -> Result<Self::Value, E>
+    where
+        E: de::Error,
+    {
+        self.visit_str(value)
+    }
+}
+
+fn parse_levels(levels: Vec<[JsonF64; 2]>) -> Vec<PriceLevel> {
+    levels
         .into_iter()
-        .flat_map(|levels| levels.iter())
-        .filter_map(parse_level)
+        .map(|[price, qty]| PriceLevel {
+            price: price.0,
+            qty: qty.0,
+        })
         .collect()
 }
 
-fn parse_level(value: &Value) -> Option<PriceLevel> {
-    let values = value.as_array()?;
-    Some(PriceLevel {
-        price: parse_number(values.first()?)?,
-        qty: parse_number(values.get(1)?)?,
-    })
-}
-
-fn parse_number(value: &Value) -> Option<f64> {
-    value
-        .as_f64()
-        .or_else(|| value.as_str().and_then(|text| text.parse::<f64>().ok()))
+fn symbol_from_topic(topic: Option<&str>) -> Option<&str> {
+    topic?.rsplit('.').next()
 }

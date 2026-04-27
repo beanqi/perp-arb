@@ -5,6 +5,8 @@ use crate::config::{
     model::Exchange,
 };
 
+use super::book::RawDepthMessage;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Side {
@@ -17,8 +19,7 @@ pub enum Side {
 pub enum ShardEvent {
     MarketWsRaw {
         connection_id: ConnectionId,
-        exchange: Exchange,
-        payload: Vec<u8>,
+        message: RawDepthMessage,
     },
     OrderWsRaw {
         shard_id: ShardId,
