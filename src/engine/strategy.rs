@@ -264,7 +264,7 @@ fn match_open_depth(
 ) -> Option<DepthMatch> {
     match_depth(
         long_book.asks_desc().iter().rev(),
-        short_book.bids_desc().iter(),
+        short_book.bids_asc().iter().rev(),
         desired_notional,
     )
 }
@@ -275,7 +275,7 @@ fn match_close_depth(
     desired_notional: f64,
 ) -> Option<DepthMatch> {
     match_depth(
-        long_book.bids_desc().iter(),
+        long_book.bids_asc().iter().rev(),
         short_book.asks_desc().iter().rev(),
         desired_notional,
     )

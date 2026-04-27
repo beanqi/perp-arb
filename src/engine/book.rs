@@ -18,7 +18,8 @@ pub struct LocalBookState {
     pub mode: DepthMode,
     pub has_snapshot: bool,
     pub last_sequence: Option<u64>,
-    bids_desc: Vec<PriceLevel>,
+    // bids 升序、asks 降序，让买一/卖一都在数组尾部，减少热档位增量更新时的搬移。
+    bids_asc: Vec<PriceLevel>,
     asks_desc: Vec<PriceLevel>,
 }
 
@@ -63,7 +64,7 @@ impl LocalBookState {
             mode,
             has_snapshot: false,
             last_sequence: None,
-            bids_desc: Vec::new(),
+            bids_asc: Vec::new(),
             asks_desc: Vec::new(),
         }
     }
@@ -76,9 +77,9 @@ impl LocalBookState {
                 mut asks,
                 ..
             } => {
-                sort_desc(&mut bids);
+                sort_asc(&mut bids);
                 sort_desc(&mut asks);
-                self.bids_desc = bids;
+                self.bids_asc = bids;
                 self.asks_desc = asks;
                 self.has_snapshot = true;
                 self.last_sequence = sequence;
@@ -119,8 +120,8 @@ impl LocalBookState {
                     }
                 }
 
-                apply_levels(&mut self.bids_desc, bids);
-                apply_levels(&mut self.asks_desc, asks);
+                apply_levels(&mut self.bids_asc, bids, compare_price_asc);
+                apply_levels(&mut self.asks_desc, asks, compare_price_desc);
                 self.has_snapshot = true;
                 self.last_sequence = sequence.or(self.last_sequence);
                 BookApplyResult::Applied
@@ -129,15 +130,15 @@ impl LocalBookState {
     }
 
     pub fn best_bid(&self) -> Option<&PriceLevel> {
-        self.bids_desc.first()
+        self.bids_asc.last()
     }
 
     pub fn best_ask(&self) -> Option<&PriceLevel> {
         self.asks_desc.last()
     }
 
-    pub fn bids_desc(&self) -> &[PriceLevel] {
-        &self.bids_desc
+    pub fn bids_asc(&self) -> &[PriceLevel] {
+        &self.bids_asc
     }
 
     pub fn asks_desc(&self) -> &[PriceLevel] {
@@ -145,24 +146,32 @@ impl LocalBookState {
     }
 
     pub fn level_counts(&self) -> (usize, usize) {
-        (self.bids_desc.len(), self.asks_desc.len())
+        (self.bids_asc.len(), self.asks_desc.len())
     }
 
     fn clear_for_rebuild(&mut self) {
         self.has_snapshot = false;
         self.last_sequence = None;
-        self.bids_desc.clear();
+        self.bids_asc.clear();
         self.asks_desc.clear();
     }
+}
+
+fn sort_asc(levels: &mut [PriceLevel]) {
+    levels.sort_by(|left, right| compare_price_asc(left.price, right.price));
 }
 
 fn sort_desc(levels: &mut [PriceLevel]) {
     levels.sort_by(|left, right| compare_price_desc(left.price, right.price));
 }
 
-fn apply_levels(book_side: &mut Vec<PriceLevel>, updates: Vec<PriceLevel>) {
+fn apply_levels(
+    book_side: &mut Vec<PriceLevel>,
+    updates: Vec<PriceLevel>,
+    compare_price: fn(f64, f64) -> Ordering,
+) {
     for update in updates {
-        match book_side.binary_search_by(|level| compare_price_desc(level.price, update.price)) {
+        match book_side.binary_search_by(|level| compare_price(level.price, update.price)) {
             Ok(index) if update.qty == 0.0 => {
                 book_side.remove(index);
             }
@@ -175,6 +184,10 @@ fn apply_levels(book_side: &mut Vec<PriceLevel>, updates: Vec<PriceLevel>) {
             Err(_) => {}
         }
     }
+}
+
+fn compare_price_asc(left: f64, right: f64) -> Ordering {
+    left.partial_cmp(&right).unwrap_or(Ordering::Equal)
 }
 
 fn compare_price_desc(left: f64, right: f64) -> Ordering {
